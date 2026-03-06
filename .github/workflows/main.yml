@@ -1,0 +1,346 @@
+# ─────────────────────────────────────────────────────────────────────────────
+#  Full automated pipeline
+#    1. Build msm-4.4  (github.com/xyzvoid/msm-4.4, X00TD_defconfig)
+#         compiler choices: gcc-4.9 | gcc-latest
+#    2. Package with AnyKernel3  →  flashable zip
+#    3. Create a GitHub Release on xyzvoid/msm-4.4
+#    4. Send Telegram notifications  (start / success+zip / failure+log)
+#
+#  Required secrets
+#  ─────────────────
+#  GH_PAT          classic PAT  (repo + workflow scopes)
+#  TELEGRAM_TOKEN  Bot token from @BotFather
+#  TELEGRAM_CHAT   chat_id / channel_id  (e.g. -100xxxxxxxxxx)
+# ─────────────────────────────────────────────────────────────────────────────
+
+name: Build Kernel
+
+on:
+  # Manual trigger with compiler selector
+  workflow_dispatch:
+    inputs:
+      compiler:
+        description: "Compiler to use"
+        required: true
+        default: gcc-4.9
+        type: choice
+        options:
+          - gcc-4.9
+          - gcc-latest
+
+  # Automatic trigger on every push to these branches
+  push:
+    branches:
+      - main
+      - master
+      - staging
+
+# ── Top-level env (available in every step) ───────────────────────────────────
+env:
+  KERNEL_REPO:   "xyzvoid/msm-4.4"
+  KERNEL_BRANCH: "main"
+  AK3_REPO:      "xyzvoid/AnyKernel3"
+  AK3_BRANCH:    "master"
+  DEFCONFIG:     "X00TD_defconfig"
+  ARCH:          "arm64"
+  SUBARCH:       "arm64"
+  # AOSP GCC 4.9 (prebuilt)
+  GCC49_URL:     "https://android.googlesource.com/platform/prebuilts/gcc/linux-x86/aarch64/aarch64-linux-android-4.9"
+  GCC49_BRANCH:  "master"
+  # Path shortcuts (set once, reused everywhere)
+  KERNEL_DIR:    "${{ github.workspace }}/kernel"
+  AK3_DIR:       "${{ github.workspace }}/AnyKernel3"
+  GCC49_DIR:     "${{ github.workspace }}/toolchains/gcc49"
+  GCC_LATEST_DIR:"${{ github.workspace }}/toolchains/gcc-latest"
+  CLANG_DIR:     "${{ github.workspace }}/toolchains/clang"
+  OUT_DIR:       "${{ github.workspace }}/out"
+
+jobs:
+  # ════════════════════════════════════════════════════════════════════════════
+  build:
+    name: "Build · ${{ github.event.inputs.compiler || 'gcc-4.9' }}"
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+
+    steps:
+
+      # ── 0. Resolve compiler choice ─────────────────────────────────────────
+      #       When triggered by push there is no input, so default to gcc-4.9.
+      - name: Resolve compiler choice
+        id: cfg
+        run: |
+          COMPILER="${{ github.event.inputs.compiler }}"
+          COMPILER="${COMPILER:-gcc-4.9}"
+          echo "compiler=${COMPILER}" >> "$GITHUB_OUTPUT"
+
+          # Human-readable tag used in the release / Telegram messages
+          if [[ "${COMPILER}" == "gcc-4.9" ]]; then
+            echo "compiler_tag=GCC-4.9-AOSP"  >> "$GITHUB_OUTPUT"
+          else
+            echo "compiler_tag=GCC-Latest-ARM" >> "$GITHUB_OUTPUT"
+          fi
+
+      # ── 1. Telegram – build started ────────────────────────────────────────
+      - name: Telegram · Build started
+        run: |
+          TEXT="🔨 *Kernel build started*
+          • Repo: \`${{ env.KERNEL_REPO }}\`
+          • Defconfig: \`${{ env.DEFCONFIG }}\`
+          • Compiler: \`${{ steps.cfg.outputs.compiler_tag }}\`
+          • Triggered by: \`${{ github.actor }}\`
+          • Run: [#${{ github.run_number }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})"
+          curl -sSf -X POST \
+            "https://api.telegram.org/bot${{ secrets.TELEGRAM_TOKEN }}/sendMessage" \
+            -d chat_id="${{ secrets.TELEGRAM_CHAT }}" \
+            -d parse_mode="Markdown" \
+            -d disable_web_page_preview="true" \
+            -d text="${TEXT}"
+
+      # ── 2. Install build dependencies ─────────────────────────────────────
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            bc bison build-essential ca-certificates curl \
+            flex git libssl-dev libelf-dev lld llvm \
+            python3 python3-pip rsync unzip wget zip \
+            gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu
+
+      # ── 3. Checkout kernel source ──────────────────────────────────────────
+      - name: Checkout kernel source
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.KERNEL_REPO }}
+          ref:        ${{ env.KERNEL_BRANCH }}
+          token:      ${{ secrets.GH_PAT }}
+          path:       kernel
+          fetch-depth: 1
+
+      # ── 4. Checkout AnyKernel3 ─────────────────────────────────────────────
+      - name: Checkout AnyKernel3
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.AK3_REPO }}
+          ref:        ${{ env.AK3_BRANCH }}
+          token:      ${{ secrets.GH_PAT }}
+          path:       AnyKernel3
+          fetch-depth: 1
+
+      # ── 5a. Set up GCC 4.9 (AOSP) ─────────────────────────────────────────
+      - name: Set up GCC 4.9 (AOSP)
+        if: steps.cfg.outputs.compiler == 'gcc-4.9'
+        run: |
+          git clone --depth=1 \
+            --branch "${{ env.GCC49_BRANCH }}" \
+            "https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_aarch64_aarch64-linux-android-4.9.git" \
+            "${{ env.GCC49_DIR }}"
+
+      # ── 5b. Set up latest ARM GNU Toolchain ────────────────────────────────
+      - name: Set up GCC latest (ARM GNU Toolchain)
+        if: steps.cfg.outputs.compiler == 'gcc-latest'
+        run: |
+          # Fetch the current release page and extract the aarch64-none-linux-gnu tarball URL
+          DOWNLOAD_PAGE="https://developer.arm.com/downloads/-/arm-gnu-toolchain-downloads"
+          TARBALL_URL=$(curl -sSf "${DOWNLOAD_PAGE}" \
+            | grep -oP 'https://developer.arm.com/-/media/Files/downloads/gnu/[^"]+aarch64-none-linux-gnu\.tar\.xz' \
+            | head -1)
+
+          if [[ -z "${TARBALL_URL}" ]]; then
+            echo "⚠️  Could not scrape ARM download page – using known stable URL as fallback."
+            TARBALL_URL="https://developer.arm.com/-/media/Files/downloads/gnu/13.3.rel1/binrel/arm-gnu-toolchain-13.3.rel1-x86_64-aarch64-none-linux-gnu.tar.xz"
+          fi
+
+          echo "Downloading: ${TARBALL_URL}"
+          wget -q --show-progress -O /tmp/gcc-latest.tar.xz "${TARBALL_URL}"
+          mkdir -p "${{ env.GCC_LATEST_DIR }}"
+          tar -xf /tmp/gcc-latest.tar.xz -C "${{ env.GCC_LATEST_DIR }}" --strip-components=1
+          rm /tmp/gcc-latest.tar.xz
+
+      # ── 6. Export compiler variables ───────────────────────────────────────
+      - name: Export compiler environment
+        id: toolchain
+        run: |
+          if [[ "${{ steps.cfg.outputs.compiler }}" == "gcc-4.9" ]]; then
+            TC_PREFIX="${{ env.GCC49_DIR }}/bin/aarch64-linux-android-"
+            TC_PATH="${{ env.GCC49_DIR }}/bin"
+          else
+            TC_PREFIX="${{ env.GCC_LATEST_DIR }}/bin/aarch64-none-linux-gnu-"
+            TC_PATH="${{ env.GCC_LATEST_DIR }}/bin"
+          fi
+
+          echo "CROSS_COMPILE=${TC_PREFIX}" >> "$GITHUB_ENV"
+          echo "PATH=${TC_PATH}:${PATH}"    >> "$GITHUB_ENV"
+          echo "tc_prefix=${TC_PREFIX}"     >> "$GITHUB_OUTPUT"
+
+          # Verify the compiler is executable
+          "${TC_PREFIX}gcc" --version || { echo "❌ Compiler not found at ${TC_PREFIX}gcc"; exit 1; }
+
+      # ── 7. Build the kernel ────────────────────────────────────────────────
+      - name: Build kernel
+        id: build
+        working-directory: ${{ env.KERNEL_DIR }}
+        run: |
+          set -euo pipefail
+          mkdir -p "${{ env.OUT_DIR }}"
+
+          BUILD_START=$(date +%s)
+          echo "build_start=${BUILD_START}" >> "$GITHUB_OUTPUT"
+
+          # Generate .config from defconfig
+          make O="${{ env.OUT_DIR }}" \
+               ARCH="${{ env.ARCH }}" \
+               SUBARCH="${{ env.SUBARCH }}" \
+               CROSS_COMPILE="${{ env.CROSS_COMPILE }}" \
+               "${{ env.DEFCONFIG }}" 2>&1 | tee "${{ env.OUT_DIR }}/defconfig.log"
+
+          # Build (use all available CPUs)
+          make O="${{ env.OUT_DIR }}" \
+               ARCH="${{ env.ARCH }}" \
+               SUBARCH="${{ env.SUBARCH }}" \
+               CROSS_COMPILE="${{ env.CROSS_COMPILE }}" \
+               -j$(nproc --all) 2>&1 | tee "${{ env.OUT_DIR }}/build.log"
+
+          BUILD_END=$(date +%s)
+          DURATION=$(( BUILD_END - BUILD_START ))
+          echo "duration=${DURATION}" >> "$GITHUB_OUTPUT"
+          echo "✅ Build finished in ${DURATION}s"
+
+      # ── 8. Locate Image.gz-dtb ─────────────────────────────────────────────
+      - name: Locate kernel image
+        id: image
+        run: |
+          IMAGE=$(find "${{ env.OUT_DIR }}" -name "Image.gz-dtb" -o -name "Image.gz" | head -1)
+          if [[ -z "${IMAGE}" ]]; then
+            echo "❌ No kernel image found in OUT_DIR" >&2
+            exit 1
+          fi
+          echo "path=${IMAGE}" >> "$GITHUB_OUTPUT"
+          echo "Found kernel image: ${IMAGE}"
+
+      # ── 9. Package with AnyKernel3 ─────────────────────────────────────────
+      - name: Package flashable zip
+        id: zip
+        run: |
+          cp "${{ steps.image.outputs.path }}" "${{ env.AK3_DIR }}/"
+
+          KERNEL_VERSION=$(grep -m1 "^VERSION"      "${{ env.KERNEL_DIR }}/Makefile" | awk -F= '{print $2}' | tr -d ' ')
+          PATCH_LEVEL=$(grep  -m1 "^PATCHLEVEL"    "${{ env.KERNEL_DIR }}/Makefile" | awk -F= '{print $2}' | tr -d ' ')
+          SUBLEVEL=$(grep     -m1 "^SUBLEVEL"       "${{ env.KERNEL_DIR }}/Makefile" | awk -F= '{print $2}' | tr -d ' ')
+          KVER="${KERNEL_VERSION}.${PATCH_LEVEL}.${SUBLEVEL}"
+
+          DATE=$(date +%Y%m%d-%H%M)
+          COMPILER_SLUG=$(echo "${{ steps.cfg.outputs.compiler_tag }}" | tr '[:upper:]' '[:lower:]' | tr ' ' '-')
+          ZIP_NAME="kernel-${KVER}-X00TD-${COMPILER_SLUG}-${DATE}.zip"
+          ZIP_PATH="${{ github.workspace }}/${ZIP_NAME}"
+
+          cd "${{ env.AK3_DIR }}"
+          zip -r9 "${ZIP_PATH}" . \
+            -x "*.git*" -x "*.github*" -x "LICENCE" -x "README.md"
+
+          echo "path=${ZIP_PATH}" >> "$GITHUB_OUTPUT"
+          echo "name=${ZIP_NAME}" >> "$GITHUB_OUTPUT"
+          echo "kver=${KVER}"     >> "$GITHUB_OUTPUT"
+          echo "date=${DATE}"     >> "$GITHUB_OUTPUT"
+          echo "Packaged: ${ZIP_NAME}"
+
+      # ── 10. Create GitHub Release ──────────────────────────────────────────
+      - name: Create GitHub Release
+        id: release
+        uses: softprops/action-gh-release@v2
+        with:
+          token:      ${{ secrets.GH_PAT }}
+          repository: ${{ env.KERNEL_REPO }}
+          tag_name:   "v${{ steps.zip.outputs.kver }}-${{ steps.zip.outputs.date }}"
+          name:       "Kernel ${{ steps.zip.outputs.kver }} · ${{ steps.cfg.outputs.compiler_tag }} · ${{ steps.zip.outputs.date }}"
+          body: |
+            ## 📦 Kernel ${{ steps.zip.outputs.kver }} for ASUS X00TD
+
+            | Field | Value |
+            |---|---|
+            | **Device** | ASUS ZenFone Max Pro M1 (X00TD) |
+            | **Kernel** | `${{ steps.zip.outputs.kver }}` |
+            | **Defconfig** | `${{ env.DEFCONFIG }}` |
+            | **Compiler** | `${{ steps.cfg.outputs.compiler_tag }}` |
+            | **Build time** | `${{ steps.build.outputs.duration }}s` |
+            | **Triggered by** | @${{ github.actor }} |
+            | **Commit** | `${{ github.sha }}` |
+
+            ### Flash instructions
+            1. Boot into TWRP / OrangeFox
+            2. Flash the attached zip
+            3. Reboot
+
+            > **Note:** This is an automated build from CI.
+          files:      ${{ steps.zip.outputs.path }}
+          draft:      false
+          prerelease: false
+          generate_release_notes: false
+
+      # ── 11. Telegram – success ─────────────────────────────────────────────
+      - name: Telegram · Build succeeded
+        if: success()
+        run: |
+          DURATION="${{ steps.build.outputs.duration }}"
+          MINS=$(( DURATION / 60 ))
+          SECS=$(( DURATION % 60 ))
+
+          TEXT="✅ *Kernel build succeeded!*
+          • Device: \`X00TD\`
+          • Kernel: \`${{ steps.zip.outputs.kver }}\`
+          • Compiler: \`${{ steps.cfg.outputs.compiler_tag }}\`
+          • Build time: \`${MINS}m ${SECS}s\`
+          • Release: [View on GitHub](${{ steps.release.outputs.url }})
+          • Zip: \`${{ steps.zip.outputs.name }}\`"
+
+          curl -sSf -X POST \
+            "https://api.telegram.org/bot${{ secrets.TELEGRAM_TOKEN }}/sendMessage" \
+            -d chat_id="${{ secrets.TELEGRAM_CHAT }}" \
+            -d parse_mode="Markdown" \
+            -d disable_web_page_preview="true" \
+            -d text="${TEXT}"
+
+          # Upload the flashable zip to Telegram as a document
+          curl -sSf -X POST \
+            "https://api.telegram.org/bot${{ secrets.TELEGRAM_TOKEN }}/sendDocument" \
+            -F chat_id="${{ secrets.TELEGRAM_CHAT }}" \
+            -F caption="📦 ${{ steps.zip.outputs.name }}" \
+            -F document=@"${{ steps.zip.outputs.path }}"
+
+      # ── 12. Upload build log on any outcome ────────────────────────────────
+      - name: Upload build log (artifact)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log-${{ github.run_number }}
+          path: ${{ env.OUT_DIR }}/build.log
+          retention-days: 7
+
+      # ── 13. Telegram – failure ─────────────────────────────────────────────
+      - name: Telegram · Build failed
+        if: failure()
+        run: |
+          TEXT="❌ *Kernel build FAILED*
+          • Repo: \`${{ env.KERNEL_REPO }}\`
+          • Compiler: \`${{ steps.cfg.outputs.compiler_tag }}\`
+          • Triggered by: \`${{ github.actor }}\`
+          • Run: [#${{ github.run_number }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
+
+          The last 30 lines of the build log are attached 👇"
+
+          curl -sSf -X POST \
+            "https://api.telegram.org/bot${{ secrets.TELEGRAM_TOKEN }}/sendMessage" \
+            -d chat_id="${{ secrets.TELEGRAM_CHAT }}" \
+            -d parse_mode="Markdown" \
+            -d disable_web_page_preview="true" \
+            -d text="${TEXT}"
+
+          # Trim log to last 100 lines so it fits within Telegram's 50 MB limit
+          LOG="${{ env.OUT_DIR }}/build.log"
+          if [[ -f "${LOG}" ]]; then
+            tail -100 "${LOG}" > /tmp/build-tail.log
+            curl -sSf -X POST \
+              "https://api.telegram.org/bot${{ secrets.TELEGRAM_TOKEN }}/sendDocument" \
+              -F chat_id="${{ secrets.TELEGRAM_CHAT }}" \
+              -F caption="🪵 Last 100 lines of build log" \
+              -F document=@"/tmp/build-tail.log"
+          fi
