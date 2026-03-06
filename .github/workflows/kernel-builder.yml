@@ -57,12 +57,6 @@ on:
         type: choice
         options: [ 'true', 'false' ]
 
-  push:
-    branches: [ main, 'kernel/**' ]
-    paths-ignore: [ '**.md', '.github/ISSUE_TEMPLATE/**' ]
-
-  pull_request:
-    branches: [ main ]
 
 # ─────────────────────────────────────────────────────────────────────────────
 env:
