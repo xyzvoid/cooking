@@ -3,10 +3,11 @@ name: Setup Kernel with WLAN Drivers
 # ─────────────────────────────────────────────────────────────────────────────
 # What this does (in order):
 #   1. Creates a new repo on the xyzvoid GitHub organisation
-#   2. Clones msm-4.4 kernel from CLO @ LA.UM.7.2.c27-07900-sdm660.0
+#   2. Clones msm-4.4 kernel from CLO @ LA.UM.9.2.r1-03700-SDMxx0.0
 #   3. Imports qcacld-3.0    → drivers/staging/qcacld-3.0/
 #   4. Imports fw-api        → drivers/staging/fw-api/
 #   5. Imports qca-wifi-host-cmn → drivers/staging/qca-wifi-host-cmn/
+#      (WLAN drivers use LA.UM.7.2.c27-07900-sdm660.0)
 #   6. Pushes everything to xyzvoid/msm-4.4
 #
 # Prerequisite: add a repo secret named GH_PAT (classic PAT, scopes: repo + workflow)
@@ -35,10 +36,13 @@ jobs:
     runs-on: ubuntu-latest
 
     env:
-      NEW_REPO:   ${{ github.event.inputs.new_repo_name }}
-      PRIVATE:    ${{ github.event.inputs.make_private }}
-      OWNER:      xyzvoid                                   # ← hardcoded org
-      SOURCE_TAG: LA.UM.7.2.c27-07900-sdm660.0
+      NEW_REPO:        ${{ github.event.inputs.new_repo_name }}
+      PRIVATE:         ${{ github.event.inputs.make_private }}
+      OWNER:           xyzvoid                                   # ← hardcoded org
+
+      # ── Tags (kernel and drivers intentionally differ) ────────────────────
+      KERNEL_TAG:      LA.UM.9.2.r1-03700-SDMxx0.0
+      DRIVER_TAG:      LA.UM.7.2.c27-07900-sdm660.0
 
       # ── Source repos ──────────────────────────────────────────────────────
       KERNEL_URL: https://git.codelinaro.org/clo/la/kernel/msm-4.4.git
@@ -62,7 +66,8 @@ jobs:
           fi
           echo "============================================"
           echo " Kernel source : $KERNEL_URL"
-          echo " Tag           : $SOURCE_TAG"
+          echo " Kernel tag    : $KERNEL_TAG"
+          echo " Driver tag    : $DRIVER_TAG"
           echo " Destination   : github.com/$OWNER/$NEW_REPO"
           echo " Private       : $PRIVATE"
           echo "============================================"
@@ -80,9 +85,6 @@ jobs:
           git config --global user.name  "GitHub Actions"
 
       # ── 4. Create destination repo on GitHub org ──────────────────────────
-      # GH_TOKEN is set only for this step so gh CLI picks it up automatically.
-      # The PAT must have the "repo" scope AND org write access to create repos
-      # under the xyzvoid organisation.
       - name: Create GitHub repository
         env:
           GH_TOKEN: ${{ secrets.GH_PAT }}
@@ -94,7 +96,7 @@ jobs:
           fi
           gh repo create "$OWNER/$NEW_REPO" \
             $VIS \
-            --description "CLO msm-4.4 + QCA WLAN drivers @ $SOURCE_TAG" \
+            --description "CLO msm-4.4 @ $KERNEL_TAG + QCA WLAN drivers @ $DRIVER_TAG" \
             && echo "✅ Repo created: github.com/$OWNER/$NEW_REPO" \
             || echo "ℹ️  Repo may already exist — continuing"
 
@@ -104,9 +106,9 @@ jobs:
       # The kernel is large (~1-2 GB) but a full clone is the only reliable way.
       - name: Clone msm-4.4 kernel
         run: |
-          echo "Cloning kernel @ $SOURCE_TAG (full clone, this may take a few minutes) ..."
+          echo "Cloning kernel @ $KERNEL_TAG (full clone, this may take a few minutes) ..."
           git clone \
-            --branch "$SOURCE_TAG" \
+            --branch "$KERNEL_TAG" \
             --single-branch \
             "$KERNEL_URL" \
             kernel
@@ -126,30 +128,30 @@ jobs:
       - name: Import qcacld-3.0
         run: |
           cd kernel
-          echo "Fetching qcacld-3.0 @ $SOURCE_TAG ..."
-          git fetch --depth=1 "$QCACLD_URL" "refs/tags/$SOURCE_TAG"
+          echo "Fetching qcacld-3.0 @ $DRIVER_TAG ..."
+          git fetch --depth=1 "$QCACLD_URL" "refs/tags/$DRIVER_TAG"
           git read-tree --prefix="${QCACLD_PATH}/" -u FETCH_HEAD^{tree}
-          git commit -m "Import ${QCACLD_PATH} from CLO @ ${SOURCE_TAG}"
+          git commit -m "Import ${QCACLD_PATH} from CLO @ ${DRIVER_TAG}"
           echo "✅ qcacld-3.0 imported → $QCACLD_PATH/"
 
       # ── 8. Import fw-api ──────────────────────────────────────────────────
       - name: Import fw-api
         run: |
           cd kernel
-          echo "Fetching fw-api @ $SOURCE_TAG ..."
-          git fetch --depth=1 "$FWAPI_URL" "refs/tags/$SOURCE_TAG"
+          echo "Fetching fw-api @ $DRIVER_TAG ..."
+          git fetch --depth=1 "$FWAPI_URL" "refs/tags/$DRIVER_TAG"
           git read-tree --prefix="${FWAPI_PATH}/" -u FETCH_HEAD^{tree}
-          git commit -m "Import ${FWAPI_PATH} from CLO @ ${SOURCE_TAG}"
+          git commit -m "Import ${FWAPI_PATH} from CLO @ ${DRIVER_TAG}"
           echo "✅ fw-api imported → $FWAPI_PATH/"
 
       # ── 9. Import qca-wifi-host-cmn ───────────────────────────────────────
       - name: Import qca-wifi-host-cmn
         run: |
           cd kernel
-          echo "Fetching qca-wifi-host-cmn @ $SOURCE_TAG ..."
-          git fetch --depth=1 "$QCACMN_URL" "refs/tags/$SOURCE_TAG"
+          echo "Fetching qca-wifi-host-cmn @ $DRIVER_TAG ..."
+          git fetch --depth=1 "$QCACMN_URL" "refs/tags/$DRIVER_TAG"
           git read-tree --prefix="${QCACMN_PATH}/" -u FETCH_HEAD^{tree}
-          git commit -m "Import ${QCACMN_PATH} from CLO @ ${SOURCE_TAG}"
+          git commit -m "Import ${QCACMN_PATH} from CLO @ ${DRIVER_TAG}"
           echo "✅ qca-wifi-host-cmn imported → $QCACMN_PATH/"
 
       # ── 10. Push to xyzvoid/msm-4.4 ──────────────────────────────────────
@@ -169,12 +171,11 @@ jobs:
           ## ✅ Kernel + WLAN Drivers Ready
 
           **Org/Repo:** https://github.com/${OWNER}/${NEW_REPO}
-          **Tag:**      \`${SOURCE_TAG}\`
 
-          | Component | Source | Path in kernel |
-          |-----------|--------|----------------|
-          | msm-4.4 kernel | [CLO](https://git.codelinaro.org/clo/la/kernel/msm-4.4) | *(root)* |
-          | qcacld-3.0 | [CLO](https://git.codelinaro.org/clo/la/platform/vendor/qcom-opensource/wlan/qcacld-3.0) | \`${QCACLD_PATH}/\` |
-          | fw-api | [CLO](https://git.codelinaro.org/clo/la/platform/vendor/qcom-opensource/wlan/fw-api) | \`${FWAPI_PATH}/\` |
-          | qca-wifi-host-cmn | [CLO](https://git.codelinaro.org/clo/la/platform/vendor/qcom-opensource/wlan/qca-wifi-host-cmn) | \`${QCACMN_PATH}/\` |
+          | Component | Source | Tag | Path in kernel |
+          |-----------|--------|-----|----------------|
+          | msm-4.4 kernel | [CLO](https://git.codelinaro.org/clo/la/kernel/msm-4.4) | \`${KERNEL_TAG}\` | *(root)* |
+          | qcacld-3.0 | [CLO](https://git.codelinaro.org/clo/la/platform/vendor/qcom-opensource/wlan/qcacld-3.0) | \`${DRIVER_TAG}\` | \`${QCACLD_PATH}/\` |
+          | fw-api | [CLO](https://git.codelinaro.org/clo/la/platform/vendor/qcom-opensource/wlan/fw-api) | \`${DRIVER_TAG}\` | \`${FWAPI_PATH}/\` |
+          | qca-wifi-host-cmn | [CLO](https://git.codelinaro.org/clo/la/platform/vendor/qcom-opensource/wlan/qca-wifi-host-cmn) | \`${DRIVER_TAG}\` | \`${QCACMN_PATH}/\` |
           EOF
