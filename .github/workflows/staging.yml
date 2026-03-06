@@ -1,0 +1,180 @@
+name: Setup Kernel with WLAN Drivers
+
+# ─────────────────────────────────────────────────────────────────────────────
+# What this does (in order):
+#   1. Creates a new repo on the xyzvoid GitHub organisation
+#   2. Clones msm-4.4 kernel from CLO @ LA.UM.7.2.c27-07900-sdm660.0
+#   3. Imports qcacld-3.0    → drivers/staging/qcacld-3.0/
+#   4. Imports fw-api        → drivers/staging/fw-api/
+#   5. Imports qca-wifi-host-cmn → drivers/staging/qca-wifi-host-cmn/
+#   6. Pushes everything to xyzvoid/msm-4.4
+#
+# Prerequisite: add a repo secret named GH_PAT (classic PAT, scopes: repo + workflow)
+#               the PAT must belong to a member with "Create repositories" permission
+#               in the xyzvoid organisation.
+# ─────────────────────────────────────────────────────────────────────────────
+
+on:
+  workflow_dispatch:
+    inputs:
+      new_repo_name:
+        description: 'New GitHub repo name'
+        required: true
+        default: 'msm-4.4'
+      make_private:
+        description: 'Make the new repository private?'
+        required: true
+        default: 'false'
+        type: choice
+        options:
+          - 'false'
+          - 'true'
+
+jobs:
+  setup-kernel:
+    runs-on: ubuntu-latest
+
+    env:
+      NEW_REPO:   ${{ github.event.inputs.new_repo_name }}
+      PRIVATE:    ${{ github.event.inputs.make_private }}
+      OWNER:      xyzvoid                                   # ← hardcoded org
+      SOURCE_TAG: LA.UM.7.2.c27-07900-sdm660.0
+
+      # ── Source repos ──────────────────────────────────────────────────────
+      KERNEL_URL: https://git.codelinaro.org/clo/la/kernel/msm-4.4.git
+      QCACLD_URL: https://git.codelinaro.org/clo/la/platform/vendor/qcom-opensource/wlan/qcacld-3.0.git
+      FWAPI_URL:  https://git.codelinaro.org/clo/la/platform/vendor/qcom-opensource/wlan/fw-api.git
+      QCACMN_URL: https://git.codelinaro.org/clo/la/platform/vendor/qcom-opensource/wlan/qca-wifi-host-cmn.git
+
+      # ── Destination paths inside the kernel tree ──────────────────────────
+      QCACLD_PATH: drivers/staging/qcacld-3.0
+      FWAPI_PATH:  drivers/staging/fw-api
+      QCACMN_PATH: drivers/staging/qca-wifi-host-cmn
+
+    steps:
+
+      # ── 1. Validate ────────────────────────────────────────────────────────
+      - name: Validate inputs
+        run: |
+          if [[ -z "$NEW_REPO" ]]; then
+            echo "ERROR: new_repo_name cannot be empty."
+            exit 1
+          fi
+          echo "============================================"
+          echo " Kernel source : $KERNEL_URL"
+          echo " Tag           : $SOURCE_TAG"
+          echo " Destination   : github.com/$OWNER/$NEW_REPO"
+          echo " Private       : $PRIVATE"
+          echo "============================================"
+
+      # ── 2. Install tools ──────────────────────────────────────────────────
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y git gh
+
+      # ── 3. Git identity ───────────────────────────────────────────────────
+      - name: Configure git identity
+        run: |
+          git config --global user.email "actions@github.com"
+          git config --global user.name  "GitHub Actions"
+
+      # ── 4. Create destination repo on GitHub org ──────────────────────────
+      # GH_TOKEN is set only for this step so gh CLI picks it up automatically.
+      # The PAT must have the "repo" scope AND org write access to create repos
+      # under the xyzvoid organisation.
+      - name: Create GitHub repository
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        run: |
+          if [[ "$PRIVATE" == "true" ]]; then
+            VIS="--private"
+          else
+            VIS="--public"
+          fi
+          gh repo create "$OWNER/$NEW_REPO" \
+            $VIS \
+            --description "CLO msm-4.4 + QCA WLAN drivers @ $SOURCE_TAG" \
+            && echo "✅ Repo created: github.com/$OWNER/$NEW_REPO" \
+            || echo "ℹ️  Repo may already exist — continuing"
+
+      # ── 5. Clone kernel from CLO (full clone, no --depth) ─────────────────
+      # We do NOT use --depth=1 here. Shallow clones + subsequent git fetch
+      # calls create broken shallow grafts that GitHub rejects on push.
+      # The kernel is large (~1-2 GB) but a full clone is the only reliable way.
+      - name: Clone msm-4.4 kernel
+        run: |
+          echo "Cloning kernel @ $SOURCE_TAG (full clone, this may take a few minutes) ..."
+          git clone \
+            --branch "$SOURCE_TAG" \
+            --single-branch \
+            "$KERNEL_URL" \
+            kernel
+          echo "✅ Kernel cloned ($(du -sh kernel | cut -f1))"
+
+      # ── 6. Point kernel remote to xyzvoid GitHub org ──────────────────────
+      - name: Set GitHub remote
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+        run: |
+          cd kernel
+          git remote add github "https://x-access-token:${GH_PAT}@github.com/${OWNER}/${NEW_REPO}.git"
+
+      # ── 7. Import qcacld-3.0 ─────────────────────────────────────────────
+      # WLAN driver repos are small — shallow fetch is fine here since we only
+      # need the file tree, not history, and we commit it into the kernel tree.
+      - name: Import qcacld-3.0
+        run: |
+          cd kernel
+          echo "Fetching qcacld-3.0 @ $SOURCE_TAG ..."
+          git fetch --depth=1 "$QCACLD_URL" "refs/tags/$SOURCE_TAG"
+          git read-tree --prefix="${QCACLD_PATH}/" -u FETCH_HEAD^{tree}
+          git commit -m "Import ${QCACLD_PATH} from CLO @ ${SOURCE_TAG}"
+          echo "✅ qcacld-3.0 imported → $QCACLD_PATH/"
+
+      # ── 8. Import fw-api ──────────────────────────────────────────────────
+      - name: Import fw-api
+        run: |
+          cd kernel
+          echo "Fetching fw-api @ $SOURCE_TAG ..."
+          git fetch --depth=1 "$FWAPI_URL" "refs/tags/$SOURCE_TAG"
+          git read-tree --prefix="${FWAPI_PATH}/" -u FETCH_HEAD^{tree}
+          git commit -m "Import ${FWAPI_PATH} from CLO @ ${SOURCE_TAG}"
+          echo "✅ fw-api imported → $FWAPI_PATH/"
+
+      # ── 9. Import qca-wifi-host-cmn ───────────────────────────────────────
+      - name: Import qca-wifi-host-cmn
+        run: |
+          cd kernel
+          echo "Fetching qca-wifi-host-cmn @ $SOURCE_TAG ..."
+          git fetch --depth=1 "$QCACMN_URL" "refs/tags/$SOURCE_TAG"
+          git read-tree --prefix="${QCACMN_PATH}/" -u FETCH_HEAD^{tree}
+          git commit -m "Import ${QCACMN_PATH} from CLO @ ${SOURCE_TAG}"
+          echo "✅ qca-wifi-host-cmn imported → $QCACMN_PATH/"
+
+      # ── 10. Push to xyzvoid/msm-4.4 ──────────────────────────────────────
+      - name: Push to GitHub
+        run: |
+          cd kernel
+          echo "Pushing to github.com/$OWNER/$NEW_REPO ..."
+          git push github HEAD:refs/heads/main --force
+          echo ""
+          echo "✅ All done!"
+          echo "   https://github.com/$OWNER/$NEW_REPO"
+
+      # ── 11. Job summary ───────────────────────────────────────────────────
+      - name: Write job summary
+        run: |
+          cat >> $GITHUB_STEP_SUMMARY << EOF
+          ## ✅ Kernel + WLAN Drivers Ready
+
+          **Org/Repo:** https://github.com/${OWNER}/${NEW_REPO}
+          **Tag:**      \`${SOURCE_TAG}\`
+
+          | Component | Source | Path in kernel |
+          |-----------|--------|----------------|
+          | msm-4.4 kernel | [CLO](https://git.codelinaro.org/clo/la/kernel/msm-4.4) | *(root)* |
+          | qcacld-3.0 | [CLO](https://git.codelinaro.org/clo/la/platform/vendor/qcom-opensource/wlan/qcacld-3.0) | \`${QCACLD_PATH}/\` |
+          | fw-api | [CLO](https://git.codelinaro.org/clo/la/platform/vendor/qcom-opensource/wlan/fw-api) | \`${FWAPI_PATH}/\` |
+          | qca-wifi-host-cmn | [CLO](https://git.codelinaro.org/clo/la/platform/vendor/qcom-opensource/wlan/qca-wifi-host-cmn) | \`${QCACMN_PATH}/\` |
+          EOF
