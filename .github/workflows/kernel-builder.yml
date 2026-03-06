@@ -87,20 +87,19 @@ env:
   CLANG_DIR:     ${{ github.workspace }}/toolchain/clang
   GCC64_DIR:     ${{ github.workspace }}/toolchain/gcc64
   GCC32_DIR:     ${{ github.workspace }}/toolchain/gcc32
-  GCCARM_DIR:    ${{ github.workspace }}/toolchain/gcc-arm   # ARM GNU latest aarch64
-  GCCARM32_DIR:  ${{ github.workspace }}/toolchain/gcc-arm32 # ARM GNU latest arm32
+  GCCARM_DIR:    ${{ github.workspace }}/toolchain/gcc-arm
+  GCCARM32_DIR:  ${{ github.workspace }}/toolchain/gcc-arm32
   OUT:           ${{ github.workspace }}/out
   DIST:          ${{ github.workspace }}/dist
 
   # ── ccache ────────────────────────────────────────────────────────────────
-  CCACHE_DIR:     ${{ github.workspace }}/.ccache
-  CCACHE_MAXSIZE: 5G
+  CCACHE_DIR:        ${{ github.workspace }}/.ccache
+  CCACHE_MAXSIZE:    5G
+  CCACHE_COMPRESS:   1
+  CCACHE_COMPRESSLEVEL: 6
 
   # ── AOSP GCC mirror ───────────────────────────────────────────────────────
   GCC_BASE: https://android.googlesource.com/platform/prebuilts/gcc/linux-x86
-
-  # ── ARM GNU Toolchain releases API ────────────────────────────────────────
-  ARM_TOOLCHAIN_API: https://developer.arm.com/-/media/Files/downloads/gnu
 
 # ─────────────────────────────────────────────────────────────────────────────
 jobs:
@@ -133,8 +132,20 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends \
             bc bison build-essential ca-certificates ccache \
-            cpio curl flex git gnupg2 jq kmod libelf-dev \
-            libssl-dev lz4 python3 rsync xz-utils zip
+            cpio curl flex gcc git gnupg2 jq kmod libelf-dev \
+            libncurses-dev libssl-dev lz4 python3 rsync xz-utils zip
+
+          # ── Ubuntu 24.04 compat: AOSP GCC 4.9 prebuilts link against
+          #    libncurses.so.5 / libtinfo.so.5 which were removed in 24.04.
+          #    Symlinking .so.6 → .so.5 lets the old binaries load correctly.
+          for lib in libncurses libtinfo; do
+            src="/usr/lib/x86_64-linux-gnu/${lib}.so.6"
+            dst="/usr/lib/x86_64-linux-gnu/${lib}.so.5"
+            [[ -f "$src" && ! -e "$dst" ]] && sudo ln -sf "$src" "$dst" && \
+              echo "✅ Symlinked ${lib}.so.5 → .so.6"
+          done
+
+          # Put ccache wrappers first in PATH
           echo "/usr/lib/ccache" >> "$GITHUB_PATH"
 
       # ── 2. Telegram — build started ─────────────────────────────────────
@@ -144,23 +155,23 @@ jobs:
           CHAT:  ${{ secrets.TELEGRAM_CHAT }}
         run: |
           RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-          curl -sf -X POST "https://api.telegram.org/bot${TOKEN}/sendMessage" \
+          curl -sf --retry 3 -X POST "https://api.telegram.org/bot${TOKEN}/sendMessage" \
             -d chat_id="${CHAT}" \
             -d parse_mode="HTML" \
             -d disable_web_page_preview="true" \
-            -d text="$(cat << EOF
-          🔨 <b>Kernel Build Started</b>
+            -d text="$(cat <<EOF
+🔨 <b>Kernel Build Started</b>
 
-          📱 Device    : <code>${{ env.DEVICE }} (SDM660)</code>
-          🌿 Branch    : <code>${{ env.KERNEL_BRANCH }}</code>
-          🏷 Type      : <code>${{ github.event.inputs.build_type  || 'release' }}</code>
-          🛠 Compiler  : <code>${{ github.event.inputs.compiler    || 'clang'   }}</code>
-          ⚡ LTO       : <code>${{ github.event.inputs.lto         || 'thin'    }}</code>
-          🔑 KernelSU  : <code>${{ github.event.inputs.kernelsu    || 'false'   }}</code>
-          📋 Defconfig : <code>${{ env.DEFCONFIG }}</code>
-          👤 Triggered : <code>${{ github.actor }}</code>
-          🔢 Run       : <a href="${RUN_URL}">#${{ github.run_number }}</a>
-          EOF
+📱 Device    : <code>${{ env.DEVICE }} (SDM660)</code>
+🌿 Branch    : <code>${{ env.KERNEL_BRANCH }}</code>
+🏷 Type      : <code>${{ github.event.inputs.build_type  || 'release' }}</code>
+🛠 Compiler  : <code>${{ github.event.inputs.compiler    || 'clang'   }}</code>
+⚡ LTO       : <code>${{ github.event.inputs.lto         || 'thin'    }}</code>
+🔑 KernelSU  : <code>${{ github.event.inputs.kernelsu    || 'false'   }}</code>
+📋 Defconfig : <code>${{ env.DEFCONFIG }}</code>
+👤 Triggered : <code>${{ github.actor }}</code>
+🔢 Run       : <a href="${RUN_URL}">#${{ github.run_number }}</a>
+EOF
           )" || true
 
       # ── 3. Checkout kernel ──────────────────────────────────────────────
@@ -186,22 +197,22 @@ jobs:
       #  TOOLCHAIN — CLANG PATH
       # ════════════════════════════════════════════════════════════════════
 
-      # ── 5a. Resolve latest Google Clang ─────────────────────────────────
+      # ── 5a. Resolve latest Google Clang version ─────────────────────────
       - name: 🔍 Resolve latest Google Clang version
         id: clang_ver
         if: github.event.inputs.compiler == 'clang' || github.event.inputs.compiler == ''
         run: |
-          LATEST=$(curl -sf \
+          LATEST=$(curl -sf --retry 3 \
             "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+/refs/heads/main/?format=JSON" \
             | tail -n +2 \
             | python3 -c "
-          import sys, json, re
-          data = json.load(sys.stdin)
-          entries = data.get('entries', [])
-          tags = [e['name'] for e in entries if re.match(r'^clang-r[0-9a-f]+$', e.get('name',''))]
-          tags.sort()
-          print(tags[-1] if tags else 'clang-r547379b1')
-          " 2>/dev/null || echo "clang-r547379b1")
+import sys, json, re
+data = json.load(sys.stdin)
+entries = data.get('entries', [])
+tags = [e['name'] for e in entries if re.match(r'^clang-r[0-9a-f]+$', e.get('name',''))]
+tags.sort()
+print(tags[-1] if tags else 'clang-r547379b1')
+" 2>/dev/null || echo "clang-r547379b1")
           echo "version=$LATEST" >> "$GITHUB_OUTPUT"
           echo "CLANG_VERSION=$LATEST" >> "$GITHUB_ENV"
           echo "✅ Resolved Clang: $LATEST"
@@ -225,19 +236,17 @@ jobs:
           mkdir -p "$CLANG_DIR"
           URL="https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/main/${VER}.tar.gz"
           echo "⬇ $URL"
-          curl -fL "$URL" -o /tmp/clang.tar.gz
+          curl -fL --retry 3 "$URL" -o /tmp/clang.tar.gz
           tar -xzf /tmp/clang.tar.gz -C "$CLANG_DIR"
           rm /tmp/clang.tar.gz
           "$CLANG_DIR/bin/clang" --version
 
       # ════════════════════════════════════════════════════════════════════
-      #  TOOLCHAIN — GCC 4.9 PATH  (AOSP)
+      #  TOOLCHAIN — AOSP GCC 4.9  (needed by all compiler paths as
+      #  CAF scripts call gcc-version.sh with the android triplet)
       # ════════════════════════════════════════════════════════════════════
 
-      # ── 6a. Cache GCC 4.9 ───────────────────────────────────────────────
-      #  Always cached regardless of compiler choice:
-      #  Clang builds on Linux 4.4 CAF still invoke gcc-version.sh and
-      #  need CROSS_COMPILE / CROSS_COMPILE_ARM32 binaries in PATH.
+      # ── 6a. Cache AOSP GCC 4.9 ──────────────────────────────────────────
       - name: 💾 Cache AOSP GCC 4.9 toolchains
         id: cache_gcc49
         uses: actions/cache@v4
@@ -245,28 +254,36 @@ jobs:
           path: |
             ${{ env.GCC64_DIR }}
             ${{ env.GCC32_DIR }}
-          key: aosp-gcc-4.9-v1
+          key: aosp-gcc-4.9-v2
 
-      # ── 6b. Clone AOSP GCC 4.9 (if not cached) ──────────────────────────
+      # ── 6b. Clone AOSP GCC 4.9 in parallel (if not cached) ──────────────
       - name: ⬇️  Clone AOSP GCC 4.9
         if: steps.cache_gcc49.outputs.cache-hit != 'true'
         run: |
           git clone --depth=1 \
-            "$GCC_BASE/aarch64/aarch64-linux-android-4.9.git" "$GCC64_DIR"
+            "$GCC_BASE/aarch64/aarch64-linux-android-4.9.git" "$GCC64_DIR" &
           git clone --depth=1 \
-            "$GCC_BASE/arm/arm-linux-androideabi-4.9.git" "$GCC32_DIR"
+            "$GCC_BASE/arm/arm-linux-androideabi-4.9.git"     "$GCC32_DIR" &
+          wait
           echo "✅ AOSP GCC 4.9 cloned"
 
-      # ── 6c. Record GCC 4.9 version string ───────────────────────────────
+      # ── 6c. Smoke-test GCC 4.9 and record version ───────────────────────
       - name: 🔖 Record GCC 4.9 version
         if: github.event.inputs.compiler == 'gcc-4.9'
         run: |
-          VER=$("$GCC64_DIR/bin/aarch64-linux-android-gcc" --version 2>&1 | head -1 || echo "gcc-4.9")
+          BIN="$GCC64_DIR/bin/aarch64-linux-android-gcc"
+          if ! "$BIN" --version &>/dev/null; then
+            echo "❌ AOSP GCC 4.9 binary failed to execute."
+            echo "   This usually means a missing shared library."
+            ldd "$BIN" || true
+            exit 1
+          fi
+          VER=$("$BIN" --version 2>&1 | head -1)
           echo "GCC_VERSION=$VER" >> "$GITHUB_ENV"
           echo "✅ $VER"
 
       # ════════════════════════════════════════════════════════════════════
-      #  TOOLCHAIN — GCC LATEST PATH  (ARM GNU Toolchain)
+      #  TOOLCHAIN — ARM GNU TOOLCHAIN (gcc-latest)
       # ════════════════════════════════════════════════════════════════════
 
       # ── 7a. Resolve latest ARM GNU Toolchain version ─────────────────────
@@ -274,21 +291,13 @@ jobs:
         id: armgcc_ver
         if: github.event.inputs.compiler == 'gcc-latest'
         run: |
-          # ARM publishes JSON index; fall back to a known-good release
-          LATEST=$(curl -sf \
-            "https://developer.arm.com/GetEmbeddedObject?objectId=arm-gnu-toolchain-downloads" \
-            | python3 -c "
-          import sys, json, re
-          try:
-              data = json.load(sys.stdin)
-              # The page lists versions like '13.3.rel1', '14.2.rel1', etc.
-              vers = re.findall(r'(\d+\.\d+\.rel\d+)', str(data))
-              vers = sorted(set(vers), key=lambda v: [int(x) if x.isdigit() else x for x in re.split(r'[.\-]', v)])
-              print(vers[-1] if vers else '14.2.rel1')
-          except Exception:
-              print('14.2.rel1')
-          " 2>/dev/null || echo "14.2.rel1")
-
+          # Scrape the ARM downloads page for the newest aarch64-none-linux-gnu release.
+          # Falls back to a known-good version if the page structure changes.
+          LATEST=$(curl -sf --retry 3 \
+            "https://developer.arm.com/downloads/-/arm-gnu-toolchain-downloads" \
+            | grep -oP 'arm-gnu-toolchain-\K[0-9]+\.[0-9]+\.rel[0-9]+' \
+            | sort -V | tail -1 \
+            || echo "14.2.rel1")
           echo "version=$LATEST" >> "$GITHUB_OUTPUT"
           echo "ARMGCC_VERSION=$LATEST" >> "$GITHUB_ENV"
           echo "GCC_VERSION=arm-gnu-toolchain-${LATEST}" >> "$GITHUB_ENV"
@@ -305,7 +314,7 @@ jobs:
             ${{ env.GCCARM32_DIR }}
           key: arm-gnu-toolchain-${{ steps.armgcc_ver.outputs.version }}-v1
 
-      # ── 7c. Download ARM GNU Toolchain (if not cached) ───────────────────
+      # ── 7c. Download ARM GNU Toolchain in parallel (if not cached) ───────
       - name: ⬇️  Download ARM GNU Toolchain (latest)
         if: >
           github.event.inputs.compiler == 'gcc-latest' &&
@@ -313,24 +322,21 @@ jobs:
         run: |
           VER="${{ steps.armgcc_ver.outputs.version }}"
           BASE_URL="https://developer.arm.com/-/media/Files/downloads/gnu/${VER}/binrel"
-
-          # aarch64-none-linux-gnu (64-bit cross)
           TARBALL64="arm-gnu-toolchain-${VER}-x86_64-aarch64-none-linux-gnu.tar.xz"
-          # arm-none-linux-gnueabihf (32-bit cross)
           TARBALL32="arm-gnu-toolchain-${VER}-x86_64-arm-none-linux-gnueabihf.tar.xz"
 
-          echo "⬇ Downloading aarch64 toolchain…"
-          curl -fL "${BASE_URL}/${TARBALL64}" -o /tmp/gcc64.tar.xz
-          mkdir -p "$GCCARM_DIR"
-          tar -xJf /tmp/gcc64.tar.xz -C "$GCCARM_DIR" --strip-components=1
-          rm /tmp/gcc64.tar.xz
+          mkdir -p "$GCCARM_DIR" "$GCCARM32_DIR"
 
-          echo "⬇ Downloading arm32 toolchain…"
-          curl -fL "${BASE_URL}/${TARBALL32}" -o /tmp/gcc32.tar.xz
-          mkdir -p "$GCCARM32_DIR"
-          tar -xJf /tmp/gcc32.tar.xz -C "$GCCARM32_DIR" --strip-components=1
-          rm /tmp/gcc32.tar.xz
+          # Download both tarballs in parallel
+          curl -fL --retry 3 "${BASE_URL}/${TARBALL64}" -o /tmp/gcc64.tar.xz &
+          curl -fL --retry 3 "${BASE_URL}/${TARBALL32}" -o /tmp/gcc32.tar.xz &
+          wait
 
+          tar -xJf /tmp/gcc64.tar.xz -C "$GCCARM_DIR"   --strip-components=1 &
+          tar -xJf /tmp/gcc32.tar.xz -C "$GCCARM32_DIR" --strip-components=1 &
+          wait
+
+          rm -f /tmp/gcc64.tar.xz /tmp/gcc32.tar.xz
           echo "✅ ARM GNU Toolchain ${VER} installed"
           "$GCCARM_DIR/bin/aarch64-none-linux-gnu-gcc" --version | head -1
 
@@ -360,14 +366,18 @@ jobs:
           TAG="${{ github.event.inputs.release_tag }}"
           [[ -z "$TAG" ]] && TAG="v$(date -u +%Y%m%d-%H%M)"
 
-          echo "kernel_version=$KV" >> "$GITHUB_OUTPUT"
-          echo "kernel_commit=$KC"  >> "$GITHUB_OUTPUT"
-          echo "commit_msg=$KM"     >> "$GITHUB_OUTPUT"
-          echo "release_tag=$TAG"   >> "$GITHUB_OUTPUT"
+          {
+            echo "kernel_version=$KV"
+            echo "kernel_commit=$KC"
+            echo "commit_msg=$KM"
+            echo "release_tag=$TAG"
+          } >> "$GITHUB_OUTPUT"
 
-          echo "KERNEL_VERSION=$KV" >> "$GITHUB_ENV"
-          echo "KERNEL_COMMIT=$KC"  >> "$GITHUB_ENV"
-          echo "RELEASE_TAG=$TAG"   >> "$GITHUB_ENV"
+          {
+            echo "KERNEL_VERSION=$KV"
+            echo "KERNEL_COMMIT=$KC"
+            echo "RELEASE_TAG=$TAG"
+          } >> "$GITHUB_ENV"
 
           echo "Kernel : $KV  commit : $KC  tag : $TAG"
 
@@ -376,29 +386,23 @@ jobs:
         if: github.event.inputs.kernelsu == 'true'
         working-directory: kernel
         run: |
-          curl -LSs "https://raw.githubusercontent.com/tiann/KernelSU/main/kernel/setup.sh" | bash -
+          curl -LSs --retry 3 \
+            "https://raw.githubusercontent.com/tiann/KernelSU/main/kernel/setup.sh" | bash -
           KSU_VER=$(cat KernelSU/version 2>/dev/null || echo "unknown")
           echo "KSU_VERSION=$KSU_VER" >> "$GITHUB_ENV"
           echo "✅ KernelSU $KSU_VER patched"
 
       # ── 11. Configure build environment (PATH + compiler flags + LTO) ────
       #
-      #  Why a sourced array (/tmp/kbuild_args.sh) instead of an env string:
-      #  ─────────────────────────────────────────────────────────────────────
-      #  Storing "CC=clang LD=ld.lld …" in a single $GITHUB_ENV variable and
-      #  expanding it unquoted inside `make …` causes bash word-splitting to
-      #  merge adjacent tokens (e.g. "CLANG_TRIPLE=aarch64-linux-gnu-" gets
-      #  fused with the preceding word).  A bash array stored in a sourced
-      #  file is the only portable fix.
+      #  A sourced bash-array file (/tmp/kbuild_args.sh) is used instead of
+      #  a single env string to avoid bash word-splitting collapsing adjacent
+      #  make variable tokens on expansion.
       - name: 🛠 Configure build environment
         run: |
           COMPILER="${{ github.event.inputs.compiler || 'clang' }}"
           LTO_INPUT="${{ github.event.inputs.lto || 'thin' }}"
 
-          # ── PATH: always put GCC 4.9 first so gcc-version.sh is satisfied
-          #   even when using Clang.  For gcc-latest we still keep GCC 4.9 in
-          #   PATH as a fallback for any CAF scripts that hardcode the android
-          #   triplet.
+          # ── PATH: GCC 4.9 always present (CAF gcc-version.sh needs it)
           case "$COMPILER" in
             clang)
               printf '%s\n' \
@@ -414,7 +418,6 @@ jobs:
               >> "$GITHUB_PATH"
               ;;
             gcc-latest)
-              # Put ARM GNU bins first, then AOSP GCC 4.9 as CAF script fallback
               printf '%s\n' \
                 "${GCCARM_DIR}/bin" \
                 "${GCCARM32_DIR}/bin" \
@@ -424,7 +427,7 @@ jobs:
               ;;
           esac
 
-          # ── Resolve CROSS_COMPILE prefixes ──────────────────────────────
+          # ── CROSS_COMPILE prefixes ───────────────────────────────────────
           case "$COMPILER" in
             clang|gcc-4.9)
               CROSS64="aarch64-linux-android-"
@@ -438,7 +441,7 @@ jobs:
           echo "CROSS64=$CROSS64" >> "$GITHUB_ENV"
           echo "CROSS32=$CROSS32" >> "$GITHUB_ENV"
 
-          # ── Resolve LTO flag ─────────────────────────────────────────────
+          # ── LTO flag ─────────────────────────────────────────────────────
           case "$COMPILER" in
             clang)
               case "$LTO_INPUT" in
@@ -464,71 +467,66 @@ jobs:
             EXTRA_CFLAGS=""
           fi
 
-          # ── Write kbuild_args.sh (sourced by defconfig + compile steps) ──
-          #   Using a bash array completely avoids word-splitting on the
-          #   individual make variables.
-          cat > /tmp/kbuild_args.sh << KBUILD_EOF
-          #!/usr/bin/env bash
-          # Auto-generated by "Configure build environment" — do not edit
-          KBUILD_COMMON=(
-            O="${{ github.workspace }}/out"
-            ARCH=arm64
-            SUBARCH=arm64
-            CROSS_COMPILE="${CROSS64}"
-            CROSS_COMPILE_ARM32="${CROSS32}"
-          )
-          KBUILD_EOF
+          # ── Write /tmp/kbuild_args.sh ─────────────────────────────────────
+          #   Note: heredoc markers must be flush-left for bash to terminate.
+cat > /tmp/kbuild_args.sh << KBUILD_EOF
+#!/usr/bin/env bash
+# Auto-generated by "Configure build environment" — do not edit
+KBUILD_COMMON=(
+  O="${{ github.workspace }}/out"
+  ARCH=arm64
+  SUBARCH=arm64
+  CROSS_COMPILE="${CROSS64}"
+  CROSS_COMPILE_ARM32="${CROSS32}"
+)
+KBUILD_EOF
 
-          # Append compiler-specific variables
           case "$COMPILER" in
             clang)
-              cat >> /tmp/kbuild_args.sh << CLANG_EOF
-          KBUILD_COMPILER=(
-            CC=clang
-            CLANG_TRIPLE=aarch64-linux-gnu-
-            LD=ld.lld
-            AR=llvm-ar
-            NM=llvm-nm
-            OBJCOPY=llvm-objcopy
-            OBJDUMP=llvm-objdump
-            STRIP=llvm-strip
-            HOSTCC=clang
-            HOSTCXX=clang++
-            HOSTLD=ld.lld
-            HOSTAR=llvm-ar
-          )
-          CLANG_EOF
+cat >> /tmp/kbuild_args.sh << CLANG_EOF
+KBUILD_COMPILER=(
+  CC=clang
+  CLANG_TRIPLE=aarch64-linux-gnu-
+  LD=ld.lld
+  AR=llvm-ar
+  NM=llvm-nm
+  OBJCOPY=llvm-objcopy
+  OBJDUMP=llvm-objdump
+  STRIP=llvm-strip
+  HOSTCC=clang
+  HOSTCXX=clang++
+  HOSTLD=ld.lld
+  HOSTAR=llvm-ar
+)
+CLANG_EOF
               ;;
             gcc-4.9|gcc-latest)
-              # Pure GCC — no extra make vars needed
               printf 'KBUILD_COMPILER=()\n' >> /tmp/kbuild_args.sh
               ;;
           esac
 
-          # Append LTO + KCFLAGS arrays
-          cat >> /tmp/kbuild_args.sh << TAIL_EOF
-          KBUILD_LTO=(${LTO_ARG})
-          KBUILD_EXTRA=( $([ -n "$EXTRA_CFLAGS" ] && echo "KCFLAGS=$EXTRA_CFLAGS") )
-          # Merged convenience array (use "\${KBUILD_ALL[@]}" in make)
-          KBUILD_ALL=(
-            "\${KBUILD_COMMON[@]}"
-            "\${KBUILD_COMPILER[@]}"
-            "\${KBUILD_LTO[@]}"
-            "\${KBUILD_EXTRA[@]}"
-          )
-          TAIL_EOF
+cat >> /tmp/kbuild_args.sh << TAIL_EOF
+KBUILD_LTO=(${LTO_ARG})
+KBUILD_EXTRA=($([ -n "$EXTRA_CFLAGS" ] && echo "KCFLAGS=$EXTRA_CFLAGS"))
+KBUILD_ALL=(
+  "\${KBUILD_COMMON[@]}"
+  "\${KBUILD_COMPILER[@]}"
+  "\${KBUILD_LTO[@]}"
+  "\${KBUILD_EXTRA[@]}"
+)
+TAIL_EOF
 
           chmod +x /tmp/kbuild_args.sh
-          echo "── Generated /tmp/kbuild_args.sh ───────────────────────────"
+          echo "── Generated /tmp/kbuild_args.sh ──────────────────────────"
           cat /tmp/kbuild_args.sh
 
           mkdir -p "$OUT" "$DIST"
 
           echo "── Summary ─────────────────────────────────────────────────"
-          echo "COMPILER  : $COMPILER"
-          echo "LTO arg   : ${LTO_ARG:-<none>}"
-          echo "CROSS64   : $CROSS64"
-          echo "CROSS32   : $CROSS32"
+          echo "COMPILER : $COMPILER"
+          echo "LTO arg  : ${LTO_ARG:-<none>}"
+          echo "CROSS64  : $CROSS64"
+          echo "CROSS32  : $CROSS32"
 
       # ── 12. Load defconfig ───────────────────────────────────────────────
       - name: 📋 Load defconfig — ${{ env.DEFCONFIG }}
@@ -548,10 +546,7 @@ jobs:
           JOBS=$(nproc --all)
           echo "▶ make  jobs=$JOBS  compiler=${{ github.event.inputs.compiler || 'clang' }}"
           echo "▶ args: ${KBUILD_ALL[*]}"
-
-          make "${KBUILD_ALL[@]}" -j"$JOBS" \
-          2>&1 | tee "$DIST/build.log"
-
+          make "${KBUILD_ALL[@]}" -j"$JOBS" 2>&1 | tee "$DIST/build.log"
           echo "✅ Compile finished"
 
       # ── 14. Collect images + modules ─────────────────────────────────────
@@ -570,7 +565,8 @@ jobs:
               (cd "$DIST" && zip -q modules.zip ./*.ko)
           fi
           echo "MODULE_COUNT=$MODULE_COUNT" >> "$GITHUB_ENV"
-          echo "── dist ────────────────────────────"; ls -lh "$DIST"
+          echo "── dist ─────────────────────────────"
+          ls -lh "$DIST"
 
       # ── 15. Package AnyKernel3 zip ───────────────────────────────────────
       - name: 📦 Package AnyKernel3 flashable zip
@@ -580,18 +576,17 @@ jobs:
           KSU_SUFFIX=""
           [[ "${{ github.event.inputs.kernelsu }}" == "true" ]] && KSU_SUFFIX="-KSU"
           COMPILER_SHORT="${{ github.event.inputs.compiler || 'clang' }}"
-
           ZIP_NAME="${{ env.DEVICE }}-kernel-${TAG}-${COMPILER_SHORT}${KSU_SUFFIX}.zip"
+
           echo "zip_name=$ZIP_NAME" >> "$GITHUB_OUTPUT"
           echo "ZIP_NAME=$ZIP_NAME" >> "$GITHUB_ENV"
 
-          # Place image
           if [[ -f "$DIST/Image.gz-dtb" ]]; then
             cp "$DIST/Image.gz-dtb" "$ANYKERNEL_DIR/Image.gz-dtb"
           elif [[ -f "$DIST/Image" ]]; then
             cp "$DIST/Image" "$ANYKERNEL_DIR/Image"
           else
-            echo "❌ No kernel image found"; exit 1
+            echo "❌ No kernel image found in $DIST"; exit 1
           fi
           [[ -f "$DIST/dtbo.img" ]] && cp "$DIST/dtbo.img" "$ANYKERNEL_DIR/dtbo.img"
 
@@ -607,9 +602,9 @@ jobs:
       - name: ⬆️  Upload flashable zip
         uses: actions/upload-artifact@v4
         with:
-          name:             ${{ steps.package.outputs.zip_name }}
-          path:             ${{ env.DIST }}/${{ steps.package.outputs.zip_name }}
-          retention-days:   14
+          name:           ${{ steps.package.outputs.zip_name }}
+          path:           ${{ env.DIST }}/${{ steps.package.outputs.zip_name }}
+          retention-days: 14
 
       - name: ⬆️  Upload raw images
         uses: actions/upload-artifact@v4
@@ -650,8 +645,8 @@ jobs:
           START=${{ steps.timer_start.outputs.start }}
           SECS=$(( END - START ))
           DUR=$(printf '%dm %02ds' $(( SECS/60 )) $(( SECS%60 )))
-          echo "duration=$DUR"   >> "$GITHUB_OUTPUT"
-          echo "DURATION=$DUR"   >> "$GITHUB_ENV"
+          echo "duration=$DUR" >> "$GITHUB_OUTPUT"
+          echo "DURATION=$DUR" >> "$GITHUB_ENV"
 
       # ── 18. GitHub Release ────────────────────────────────────────────────
       - name: 🚀 Create GitHub Release
@@ -690,7 +685,7 @@ jobs:
             | Tool | Details |
             |------|---------|
             | Compiler | `${{ github.event.inputs.compiler || 'clang' }}` — `${{ env.CLANG_VERSION }}${{ env.GCC_VERSION }}` |
-            | GCC aarch64 (Clang assist / standalone) | `aarch64-linux-android-4.9` / `aarch64-none-linux-gnu` |
+            | GCC aarch64 | `aarch64-linux-android-4.9` / `aarch64-none-linux-gnu` |
             | GCC arm32 | `arm-linux-androideabi-4.9` / `arm-none-linux-gnueabihf` |
             | LTO | `${{ github.event.inputs.lto || 'thin' }}` |
             | KernelSU | `${{ github.event.inputs.kernelsu == 'true' && env.KSU_VERSION || 'No' }}` |
@@ -721,43 +716,41 @@ jobs:
         run: |
           ZIP_PATH="$DIST/$ZIP_NAME"
           ZIP_SIZE_MB=$(du -sm "$ZIP_PATH" 2>/dev/null | cut -f1 || echo "0")
-          TAG="$RELEASE_TAG"
-          RELEASE_URL="https://github.com/${{ env.KERNEL_REPO }}/releases/tag/${TAG}"
+          RELEASE_URL="https://github.com/${{ env.KERNEL_REPO }}/releases/tag/${RELEASE_TAG}"
           RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
 
-          TOOLCHAIN_LINE=""
           case "${{ github.event.inputs.compiler || 'clang' }}" in
             clang)      TOOLCHAIN_LINE="🔨 Clang    : <code>${CLANG_VERSION}</code>" ;;
-            gcc-4.9)    TOOLCHAIN_LINE="🔨 GCC      : <code>${GCC_VERSION}</code>" ;;
-            gcc-latest) TOOLCHAIN_LINE="🔨 ARM GCC  : <code>${GCC_VERSION}</code>" ;;
+            gcc-4.9)    TOOLCHAIN_LINE="🔨 GCC      : <code>${GCC_VERSION}</code>"  ;;
+            gcc-latest) TOOLCHAIN_LINE="🔨 ARM GCC  : <code>${GCC_VERSION}</code>"  ;;
           esac
 
-          CAPTION="$(cat << EOF
-          ✅ <b>Kernel Build Success!</b>
+          CAPTION="$(cat <<EOF
+✅ <b>Kernel Build Success!</b>
 
-          📱 <b>${{ env.DEVICE }}</b> · SDM660
-          🔖 Tag      : <code>${TAG}</code>
-          🐧 Version  : <code>$KERNEL_VERSION</code>
-          🛠 Compiler : <code>${{ github.event.inputs.compiler || 'clang' }}</code>
-          ${TOOLCHAIN_LINE}
-          ⚡ LTO      : <code>${{ github.event.inputs.lto || 'thin' }}</code>
-          🔑 KernelSU : <code>${{ github.event.inputs.kernelsu == 'true' && env.KSU_VERSION || 'No' }}</code>
-          📝 Commit   : <code>$KERNEL_COMMIT</code>
-          ⏱ Duration  : <b>$DURATION</b>
-          📦 Modules  : <code>$MODULE_COUNT</code>
+📱 <b>${{ env.DEVICE }}</b> · SDM660
+🔖 Tag      : <code>${RELEASE_TAG}</code>
+🐧 Version  : <code>${KERNEL_VERSION}</code>
+🛠 Compiler : <code>${{ github.event.inputs.compiler || 'clang' }}</code>
+${TOOLCHAIN_LINE}
+⚡ LTO      : <code>${{ github.event.inputs.lto || 'thin' }}</code>
+🔑 KernelSU : <code>${{ github.event.inputs.kernelsu == 'true' && env.KSU_VERSION || 'No' }}</code>
+📝 Commit   : <code>${KERNEL_COMMIT}</code>
+⏱ Duration  : <b>${DURATION}</b>
+📦 Modules  : <code>${MODULE_COUNT}</code>
 
-          🚀 <a href="${RELEASE_URL}">GitHub Release</a>  ·  <a href="${RUN_URL}">Action Log</a>
-          EOF
+🚀 <a href="${RELEASE_URL}">GitHub Release</a>  ·  <a href="${RUN_URL}">Action Log</a>
+EOF
           )"
 
           if [[ "$ZIP_SIZE_MB" -le 50 ]]; then
-            curl -sf -X POST "https://api.telegram.org/bot${TOKEN}/sendDocument" \
+            curl -sf --retry 3 -X POST "https://api.telegram.org/bot${TOKEN}/sendDocument" \
               -F chat_id="${CHAT}" \
               -F parse_mode="HTML" \
               -F caption="${CAPTION}" \
               -F document="@${ZIP_PATH}" || true
           else
-            curl -sf -X POST "https://api.telegram.org/bot${TOKEN}/sendMessage" \
+            curl -sf --retry 3 -X POST "https://api.telegram.org/bot${TOKEN}/sendMessage" \
               -d chat_id="${CHAT}" \
               -d parse_mode="HTML" \
               -d disable_web_page_preview="false" \
@@ -780,28 +773,28 @@ jobs:
               | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g' || true)
           fi
 
-          curl -sf -X POST "https://api.telegram.org/bot${TOKEN}/sendMessage" \
+          curl -sf --retry 3 -X POST "https://api.telegram.org/bot${TOKEN}/sendMessage" \
             -d chat_id="${CHAT}" \
             -d parse_mode="HTML" \
             -d disable_web_page_preview="true" \
-            -d text="$(cat << EOF
-          ❌ <b>Kernel Build Failed!</b>
+            -d text="$(cat <<EOF
+❌ <b>Kernel Build Failed!</b>
 
-          📱 <b>${{ env.DEVICE }}</b> · SDM660
-          🌿 Branch   : <code>${{ env.KERNEL_BRANCH }}</code>
-          🏷 Type     : <code>${{ github.event.inputs.build_type || 'release' }}</code>
-          🛠 Compiler : <code>${{ github.event.inputs.compiler || 'clang' }}</code>
-          ⚡ LTO      : <code>${{ github.event.inputs.lto || 'thin' }}</code>
-          ⏱ Duration  : <b>$DURATION</b>
-          🔢 Run      : <a href="${RUN_URL}">#${{ github.run_number }}</a>
+📱 <b>${{ env.DEVICE }}</b> · SDM660
+🌿 Branch   : <code>${{ env.KERNEL_BRANCH }}</code>
+🏷 Type     : <code>${{ github.event.inputs.build_type || 'release' }}</code>
+🛠 Compiler : <code>${{ github.event.inputs.compiler || 'clang' }}</code>
+⚡ LTO      : <code>${{ github.event.inputs.lto || 'thin' }}</code>
+⏱ Duration  : <b>${DURATION}</b>
+🔢 Run      : <a href="${RUN_URL}">#${{ github.run_number }}</a>
 
-          <b>Last errors:</b>
-          <pre>${LOG_SNIPPET}</pre>
-          EOF
+<b>Last errors:</b>
+<pre>${LOG_SNIPPET}</pre>
+EOF
           )" || true
 
           if [[ -f "$DIST/build.log" ]]; then
-            curl -sf -X POST "https://api.telegram.org/bot${TOKEN}/sendDocument" \
+            curl -sf --retry 3 -X POST "https://api.telegram.org/bot${TOKEN}/sendDocument" \
               -F chat_id="${CHAT}" \
               -F caption="📋 Full build log · Run #${{ github.run_number }}" \
               -F document="@${DIST}/build.log" || true
@@ -819,44 +812,43 @@ jobs:
           [[ -f "$DIST/dtbo.img"     ]] && HAS_DTBO="✅"
           [[ -f "$DIST/$ZIP_NAME"    ]] && HAS_ZIP="✅"
 
-          TOOLCHAIN_DETAIL=""
           case "${{ github.event.inputs.compiler || 'clang' }}" in
             clang)      TOOLCHAIN_DETAIL="${CLANG_VERSION}" ;;
-            gcc-4.9)    TOOLCHAIN_DETAIL="${GCC_VERSION}" ;;
-            gcc-latest) TOOLCHAIN_DETAIL="${GCC_VERSION}" ;;
+            gcc-4.9)    TOOLCHAIN_DETAIL="${GCC_VERSION}"   ;;
+            gcc-latest) TOOLCHAIN_DETAIL="${GCC_VERSION}"   ;;
           esac
 
           cat >> "$GITHUB_STEP_SUMMARY" << EOF
-          ## ${ICON} ${{ env.DEVICE }} Kernel — ${{ steps.meta.outputs.release_tag }}
+## ${ICON} ${{ env.DEVICE }} Kernel — ${{ steps.meta.outputs.release_tag }}
 
-          | | |
-          |-|-|
-          | Status   | **${{ job.status }}** |
-          | Duration | **$DURATION** |
-          | Run | [#${{ github.run_number }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) |
+| | |
+|-|-|
+| Status   | **${{ job.status }}** |
+| Duration | **${DURATION}** |
+| Run | [#${{ github.run_number }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) |
 
-          ### 🧰 Toolchain
-          | Component | Details |
-          |-----------|---------|
-          | Compiler | \`${{ github.event.inputs.compiler || 'clang' }}\` |
-          | Version | \`${TOOLCHAIN_DETAIL}\` |
-          | LTO | \`${{ github.event.inputs.lto || 'thin' }}\` |
-          | KernelSU | \`${{ github.event.inputs.kernelsu == 'true' && env.KSU_VERSION || 'No' }}\` |
+### 🧰 Toolchain
+| Component | Details |
+|-----------|---------|
+| Compiler | \`${{ github.event.inputs.compiler || 'clang' }}\` |
+| Version | \`${TOOLCHAIN_DETAIL}\` |
+| LTO | \`${{ github.event.inputs.lto || 'thin' }}\` |
+| KernelSU | \`${{ github.event.inputs.kernelsu == 'true' && env.KSU_VERSION || 'No' }}\` |
 
-          ### 🐧 Kernel
-          | Field | Value |
-          |-------|-------|
-          | Version | \`$KERNEL_VERSION\` |
-          | Commit | \`$KERNEL_COMMIT\` |
-          | Defconfig | \`${{ env.DEFCONFIG }}\` |
-          | Build type | \`${{ github.event.inputs.build_type || 'release' }}\` |
+### 🐧 Kernel
+| Field | Value |
+|-------|-------|
+| Version | \`${KERNEL_VERSION}\` |
+| Commit | \`${KERNEL_COMMIT}\` |
+| Defconfig | \`${{ env.DEFCONFIG }}\` |
+| Build type | \`${{ github.event.inputs.build_type || 'release' }}\` |
 
-          ### 📦 Artifacts
-          | File | |
-          |------|---|
-          | AnyKernel3 zip | ${HAS_ZIP} |
-          | \`Image\` | ${HAS_IMG} |
-          | \`Image.gz-dtb\` | ${HAS_GZ} |
-          | \`dtbo.img\` | ${HAS_DTBO} |
-          | Modules | \`$MODULE_COUNT\` .ko files |
-          EOF
+### 📦 Artifacts
+| File | |
+|------|---|
+| AnyKernel3 zip | ${HAS_ZIP} |
+| \`Image\` | ${HAS_IMG} |
+| \`Image.gz-dtb\` | ${HAS_GZ} |
+| \`dtbo.img\` | ${HAS_DTBO} |
+| Modules | \`${MODULE_COUNT}\` .ko files |
+EOF
