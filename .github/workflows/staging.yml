@@ -3,12 +3,13 @@ name: Setup Kernel with WLAN Drivers
 # ─────────────────────────────────────────────────────────────────────────────
 # What this does (in order):
 #   1. Creates a new repo on the xyzvoid GitHub organisation
+#      (skips creation if the repo already exists)
 #   2. Clones msm-4.4 kernel from CLO @ LA.UM.9.2.r1-03700-SDMxx0.0
 #   3. Imports qcacld-3.0    → drivers/staging/qcacld-3.0/
 #   4. Imports fw-api        → drivers/staging/fw-api/
 #   5. Imports qca-wifi-host-cmn → drivers/staging/qca-wifi-host-cmn/
 #      (WLAN drivers use LA.UM.7.2.c27-07900-sdm660.0)
-#   6. Pushes everything to xyzvoid/msm-4.4
+#   6. Pushes everything to xyzvoid/msm-4.4 on the specified branch
 #
 # Prerequisite: add a repo secret named GH_PAT (classic PAT, scopes: repo + workflow)
 #               the PAT must belong to a member with "Create repositories" permission
@@ -22,6 +23,10 @@ on:
         description: 'New GitHub repo name'
         required: true
         default: 'msm-4.4'
+      branch:
+        description: 'Branch name to push to'
+        required: true
+        default: 'main'
       make_private:
         description: 'Make the new repository private?'
         required: true
@@ -37,6 +42,7 @@ jobs:
 
     env:
       NEW_REPO:        ${{ github.event.inputs.new_repo_name }}
+      BRANCH:          ${{ github.event.inputs.branch }}
       PRIVATE:         ${{ github.event.inputs.make_private }}
       OWNER:           xyzvoid                                   # ← hardcoded org
 
@@ -64,11 +70,16 @@ jobs:
             echo "ERROR: new_repo_name cannot be empty."
             exit 1
           fi
+          if [[ -z "$BRANCH" ]]; then
+            echo "ERROR: branch cannot be empty."
+            exit 1
+          fi
           echo "============================================"
           echo " Kernel source : $KERNEL_URL"
           echo " Kernel tag    : $KERNEL_TAG"
           echo " Driver tag    : $DRIVER_TAG"
           echo " Destination   : github.com/$OWNER/$NEW_REPO"
+          echo " Branch        : $BRANCH"
           echo " Private       : $PRIVATE"
           echo "============================================"
 
@@ -84,21 +95,24 @@ jobs:
           git config --global user.email "actions@github.com"
           git config --global user.name  "GitHub Actions"
 
-      # ── 4. Create destination repo on GitHub org ──────────────────────────
+      # ── 4. Create destination repo on GitHub org (skip if already exists) ─
       - name: Create GitHub repository
         env:
           GH_TOKEN: ${{ secrets.GH_PAT }}
         run: |
-          if [[ "$PRIVATE" == "true" ]]; then
-            VIS="--private"
+          if gh repo view "$OWNER/$NEW_REPO" > /dev/null 2>&1; then
+            echo "ℹ️  Repo already exists — skipping creation, will push new branch '$BRANCH'"
           else
-            VIS="--public"
+            if [[ "$PRIVATE" == "true" ]]; then
+              VIS="--private"
+            else
+              VIS="--public"
+            fi
+            gh repo create "$OWNER/$NEW_REPO" \
+              $VIS \
+              --description "CLO msm-4.4 @ $KERNEL_TAG + QCA WLAN drivers @ $DRIVER_TAG"
+            echo "✅ Repo created: github.com/$OWNER/$NEW_REPO"
           fi
-          gh repo create "$OWNER/$NEW_REPO" \
-            $VIS \
-            --description "CLO msm-4.4 @ $KERNEL_TAG + QCA WLAN drivers @ $DRIVER_TAG" \
-            && echo "✅ Repo created: github.com/$OWNER/$NEW_REPO" \
-            || echo "ℹ️  Repo may already exist — continuing"
 
       # ── 5. Clone kernel from CLO (full clone, no --depth) ─────────────────
       # We do NOT use --depth=1 here. Shallow clones + subsequent git fetch
@@ -154,7 +168,7 @@ jobs:
           git commit -m "Import ${QCACMN_PATH} from CLO @ ${DRIVER_TAG}"
           echo "✅ qca-wifi-host-cmn imported → $QCACMN_PATH/"
 
-      # ── 10. Push to xyzvoid/msm-4.4 ──────────────────────────────────────
+      # ── 10. Push to xyzvoid/<repo> on the specified branch ────────────────
       - name: Push to GitHub
         env:
           GH_PAT: ${{ secrets.GH_PAT }}
@@ -162,11 +176,11 @@ jobs:
           cd kernel
           # Re-authenticate the remote URL in this step's shell environment
           git remote set-url github "https://x-access-token:${GH_PAT}@github.com/${OWNER}/${NEW_REPO}.git"
-          echo "Pushing to github.com/$OWNER/$NEW_REPO ..."
-          git push github HEAD:refs/heads/main --force
+          echo "Pushing to github.com/$OWNER/$NEW_REPO (branch: $BRANCH) ..."
+          git push github HEAD:refs/heads/${BRANCH} --force
           echo ""
           echo "✅ All done!"
-          echo "   https://github.com/$OWNER/$NEW_REPO"
+          echo "   https://github.com/$OWNER/$NEW_REPO/tree/${BRANCH}"
 
       # ── 11. Job summary ───────────────────────────────────────────────────
       - name: Write job summary
@@ -174,7 +188,7 @@ jobs:
           cat >> $GITHUB_STEP_SUMMARY << EOF
           ## ✅ Kernel + WLAN Drivers Ready
 
-          **Org/Repo:** https://github.com/${OWNER}/${NEW_REPO}
+          **Org/Repo:** https://github.com/${OWNER}/${NEW_REPO}/tree/${BRANCH}
 
           | Component | Source | Tag | Path in kernel |
           |-----------|--------|-----|----------------|
