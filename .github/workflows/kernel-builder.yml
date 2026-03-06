@@ -66,7 +66,7 @@ env:
   ANYKERNEL_REPO:    xyzvoid/AnyKernel3
 
   # ── Build config ──────────────────────────────────────────────────────────
-  DEFCONFIG:   vendor/X00TD_defconfig
+  DEFCONFIG:   X00TD_defconfig
   ARCH:        arm64
   SUBARCH:     arm64
   DEVICE:      X00TD
