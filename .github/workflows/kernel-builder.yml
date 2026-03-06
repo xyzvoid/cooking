@@ -235,12 +235,11 @@ jobs:
       # ════════════════════════════════════════════════════════════════════
 
       # ── 6a. Cache GCC 4.9 ───────────────────────────────────────────────
+      #  Always cached regardless of compiler choice:
+      #  Clang builds on Linux 4.4 CAF still invoke gcc-version.sh and
+      #  need CROSS_COMPILE / CROSS_COMPILE_ARM32 binaries in PATH.
       - name: 💾 Cache AOSP GCC 4.9 toolchains
         id: cache_gcc49
-        if: >
-          github.event.inputs.compiler == 'gcc-4.9' ||
-          github.event.inputs.compiler == 'clang'   ||
-          github.event.inputs.compiler == ''
         uses: actions/cache@v4
         with:
           path: |
@@ -250,11 +249,7 @@ jobs:
 
       # ── 6b. Clone AOSP GCC 4.9 (if not cached) ──────────────────────────
       - name: ⬇️  Clone AOSP GCC 4.9
-        if: >
-          (github.event.inputs.compiler == 'gcc-4.9' ||
-           github.event.inputs.compiler == 'clang'   ||
-           github.event.inputs.compiler == '') &&
-          steps.cache_gcc49.outputs.cache-hit != 'true'
+        if: steps.cache_gcc49.outputs.cache-hit != 'true'
         run: |
           git clone --depth=1 \
             "$GCC_BASE/aarch64/aarch64-linux-android-4.9.git" "$GCC64_DIR"
@@ -387,87 +382,161 @@ jobs:
           echo "✅ KernelSU $KSU_VER patched"
 
       # ── 11. Configure build environment (PATH + compiler flags + LTO) ────
+      #
+      #  Why a sourced array (/tmp/kbuild_args.sh) instead of an env string:
+      #  ─────────────────────────────────────────────────────────────────────
+      #  Storing "CC=clang LD=ld.lld …" in a single $GITHUB_ENV variable and
+      #  expanding it unquoted inside `make …` causes bash word-splitting to
+      #  merge adjacent tokens (e.g. "CLANG_TRIPLE=aarch64-linux-gnu-" gets
+      #  fused with the preceding word).  A bash array stored in a sourced
+      #  file is the only portable fix.
       - name: 🛠 Configure build environment
         run: |
           COMPILER="${{ github.event.inputs.compiler || 'clang' }}"
           LTO_INPUT="${{ github.event.inputs.lto || 'thin' }}"
 
-          # ── PATH ──
+          # ── PATH: always put GCC 4.9 first so gcc-version.sh is satisfied
+          #   even when using Clang.  For gcc-latest we still keep GCC 4.9 in
+          #   PATH as a fallback for any CAF scripts that hardcode the android
+          #   triplet.
           case "$COMPILER" in
             clang)
-              printf '%s\n' "${CLANG_DIR}/bin" "${GCC64_DIR}/bin" "${GCC32_DIR}/bin" >> "$GITHUB_PATH"
+              printf '%s\n' \
+                "${CLANG_DIR}/bin" \
+                "${GCC64_DIR}/bin" \
+                "${GCC32_DIR}/bin" \
+              >> "$GITHUB_PATH"
               ;;
             gcc-4.9)
-              printf '%s\n' "${GCC64_DIR}/bin" "${GCC32_DIR}/bin" >> "$GITHUB_PATH"
+              printf '%s\n' \
+                "${GCC64_DIR}/bin" \
+                "${GCC32_DIR}/bin" \
+              >> "$GITHUB_PATH"
               ;;
             gcc-latest)
-              printf '%s\n' "${GCCARM_DIR}/bin" "${GCCARM32_DIR}/bin" >> "$GITHUB_PATH"
+              # Put ARM GNU bins first, then AOSP GCC 4.9 as CAF script fallback
+              printf '%s\n' \
+                "${GCCARM_DIR}/bin" \
+                "${GCCARM32_DIR}/bin" \
+                "${GCC64_DIR}/bin" \
+                "${GCC32_DIR}/bin" \
+              >> "$GITHUB_PATH"
               ;;
           esac
 
-          # ── Cross-compile prefixes ──
+          # ── Resolve CROSS_COMPILE prefixes ──────────────────────────────
           case "$COMPILER" in
             clang|gcc-4.9)
-              echo "CROSS64=aarch64-linux-android-"    >> "$GITHUB_ENV"
-              echo "CROSS32=arm-linux-androideabi-"    >> "$GITHUB_ENV"
+              CROSS64="aarch64-linux-android-"
+              CROSS32="arm-linux-androideabi-"
               ;;
             gcc-latest)
-              echo "CROSS64=aarch64-none-linux-gnu-"   >> "$GITHUB_ENV"
-              echo "CROSS32=arm-none-linux-gnueabihf-" >> "$GITHUB_ENV"
+              CROSS64="aarch64-none-linux-gnu-"
+              CROSS32="arm-none-linux-gnueabihf-"
               ;;
           esac
+          echo "CROSS64=$CROSS64" >> "$GITHUB_ENV"
+          echo "CROSS32=$CROSS32" >> "$GITHUB_ENV"
 
-          # ── Compiler-specific make vars ──
+          # ── Resolve LTO flag ─────────────────────────────────────────────
           case "$COMPILER" in
             clang)
-              # Full Clang toolchain: llvm binutils + clang host tools
-              {
-                echo "COMPILER_MAKE_VARS=CC=clang CLANG_TRIPLE=aarch64-linux-gnu- LD=ld.lld AR=llvm-ar NM=llvm-nm OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip HOSTCC=clang HOSTCXX=clang++ HOSTLD=ld.lld HOSTAR=llvm-ar"
-              } >> "$GITHUB_ENV"
-
               case "$LTO_INPUT" in
-                thin) echo "LTO_FLAGS=LTO=thin" >> "$GITHUB_ENV" ;;
-                full) echo "LTO_FLAGS=LTO=full" >> "$GITHUB_ENV" ;;
-                none) echo "LTO_FLAGS="         >> "$GITHUB_ENV" ;;
+                thin) LTO_ARG="LTO=thin" ;;
+                full) LTO_ARG="LTO=full" ;;
+                none) LTO_ARG=""         ;;
               esac
               ;;
-
             gcc-4.9|gcc-latest)
-              # Pure GCC build — no LLVM binutils; clang not in PATH for this path
-              echo "COMPILER_MAKE_VARS=" >> "$GITHUB_ENV"
-
-              # GCC LTO: only 'full' or 'none' are meaningful;
-              # 'thin' is Clang-only — map it to 'full' for GCC
               case "$LTO_INPUT" in
-                thin) echo "LTO_FLAGS=LTO=full" >> "$GITHUB_ENV"
-                      echo "⚠️ thin-LTO is Clang-only; using full LTO for GCC" ;;
-                full) echo "LTO_FLAGS=LTO=full" >> "$GITHUB_ENV" ;;
-                none) echo "LTO_FLAGS="         >> "$GITHUB_ENV" ;;
+                thin) LTO_ARG="LTO=full"
+                      echo "⚠️  thin-LTO is Clang-only; promoting to full LTO for GCC" ;;
+                full) LTO_ARG="LTO=full" ;;
+                none) LTO_ARG=""         ;;
               esac
               ;;
           esac
 
-          # ── Debug flags ──
-          [[ "${{ github.event.inputs.build_type || 'release' }}" == "debug" ]] \
-            && echo "EXTRA_CFLAGS=-g" >> "$GITHUB_ENV" \
-            || echo "EXTRA_CFLAGS="   >> "$GITHUB_ENV"
+          # ── Debug CFLAGS ─────────────────────────────────────────────────
+          if [[ "${{ github.event.inputs.build_type || 'release' }}" == "debug" ]]; then
+            EXTRA_CFLAGS="-g"
+          else
+            EXTRA_CFLAGS=""
+          fi
+
+          # ── Write kbuild_args.sh (sourced by defconfig + compile steps) ──
+          #   Using a bash array completely avoids word-splitting on the
+          #   individual make variables.
+          cat > /tmp/kbuild_args.sh << KBUILD_EOF
+          #!/usr/bin/env bash
+          # Auto-generated by "Configure build environment" — do not edit
+          KBUILD_COMMON=(
+            O="${{ github.workspace }}/out"
+            ARCH=arm64
+            SUBARCH=arm64
+            CROSS_COMPILE="${CROSS64}"
+            CROSS_COMPILE_ARM32="${CROSS32}"
+          )
+          KBUILD_EOF
+
+          # Append compiler-specific variables
+          case "$COMPILER" in
+            clang)
+              cat >> /tmp/kbuild_args.sh << CLANG_EOF
+          KBUILD_COMPILER=(
+            CC=clang
+            CLANG_TRIPLE=aarch64-linux-gnu-
+            LD=ld.lld
+            AR=llvm-ar
+            NM=llvm-nm
+            OBJCOPY=llvm-objcopy
+            OBJDUMP=llvm-objdump
+            STRIP=llvm-strip
+            HOSTCC=clang
+            HOSTCXX=clang++
+            HOSTLD=ld.lld
+            HOSTAR=llvm-ar
+          )
+          CLANG_EOF
+              ;;
+            gcc-4.9|gcc-latest)
+              # Pure GCC — no extra make vars needed
+              printf 'KBUILD_COMPILER=()\n' >> /tmp/kbuild_args.sh
+              ;;
+          esac
+
+          # Append LTO + KCFLAGS arrays
+          cat >> /tmp/kbuild_args.sh << TAIL_EOF
+          KBUILD_LTO=(${LTO_ARG})
+          KBUILD_EXTRA=( $([ -n "$EXTRA_CFLAGS" ] && echo "KCFLAGS=$EXTRA_CFLAGS") )
+          # Merged convenience array (use "\${KBUILD_ALL[@]}" in make)
+          KBUILD_ALL=(
+            "\${KBUILD_COMMON[@]}"
+            "\${KBUILD_COMPILER[@]}"
+            "\${KBUILD_LTO[@]}"
+            "\${KBUILD_EXTRA[@]}"
+          )
+          TAIL_EOF
+
+          chmod +x /tmp/kbuild_args.sh
+          echo "── Generated /tmp/kbuild_args.sh ───────────────────────────"
+          cat /tmp/kbuild_args.sh
 
           mkdir -p "$OUT" "$DIST"
 
-          echo "── Environment summary ──────────────────────────────────────"
-          echo "COMPILER       : $COMPILER"
-          echo "LTO input      : $LTO_INPUT"
+          echo "── Summary ─────────────────────────────────────────────────"
+          echo "COMPILER  : $COMPILER"
+          echo "LTO arg   : ${LTO_ARG:-<none>}"
+          echo "CROSS64   : $CROSS64"
+          echo "CROSS32   : $CROSS32"
 
       # ── 12. Load defconfig ───────────────────────────────────────────────
       - name: 📋 Load defconfig — ${{ env.DEFCONFIG }}
         working-directory: kernel
         run: |
-          make \
-            O="$OUT" ARCH=arm64 SUBARCH=arm64 \
-            CROSS_COMPILE="$CROSS64" \
-            CROSS_COMPILE_ARM32="$CROSS32" \
-            $COMPILER_MAKE_VARS \
-            "$DEFCONFIG"
+          source /tmp/kbuild_args.sh
+          echo "▶ make ${KBUILD_ALL[*]} $DEFCONFIG"
+          make "${KBUILD_ALL[@]}" "$DEFCONFIG"
 
       # ── 13. Compile ──────────────────────────────────────────────────────
       - name: 🔨 Compile kernel  [${{ github.event.inputs.compiler || 'clang' }}]
@@ -475,17 +544,12 @@ jobs:
         working-directory: kernel
         run: |
           set -o pipefail
+          source /tmp/kbuild_args.sh
           JOBS=$(nproc --all)
-          echo "▶ make  jobs=$JOBS  compiler=${{ github.event.inputs.compiler || 'clang' }}  lto=$LTO_FLAGS"
+          echo "▶ make  jobs=$JOBS  compiler=${{ github.event.inputs.compiler || 'clang' }}"
+          echo "▶ args: ${KBUILD_ALL[*]}"
 
-          make \
-            O="$OUT" ARCH=arm64 SUBARCH=arm64 \
-            CROSS_COMPILE="$CROSS64" \
-            CROSS_COMPILE_ARM32="$CROSS32" \
-            $COMPILER_MAKE_VARS \
-            $LTO_FLAGS \
-            KCFLAGS="$EXTRA_CFLAGS" \
-            -j"$JOBS" \
+          make "${KBUILD_ALL[@]}" -j"$JOBS" \
           2>&1 | tee "$DIST/build.log"
 
           echo "✅ Compile finished"
