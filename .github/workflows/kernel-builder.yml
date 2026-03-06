@@ -181,9 +181,14 @@ jobs:
           rm /tmp/clang.tar.gz
           "$CLANG_DIR/bin/clang" --version
 
-      # ── 7. Cache GCC ──────────────────────────────────────────────────────
-      - name: 💾 Cache GCC toolchains
+      # ── 7. Cache AOSP GCC (Clang builds only) ────────────────────────────
+      # AOSP GCC 4.9 prebuilts are 32-bit x86 ELF binaries. Ubuntu 24.04
+      # dropped ia32 support so they silently fail to execute. We only use
+      # them for Clang builds (as assembler/linker fallback via CROSS_COMPILE).
+      # GCC builds use gcc-aarch64-linux-gnu from apt instead — native 64-bit.
+      - name: 💾 Cache AOSP GCC toolchains
         id: cache_gcc
+        if: github.event.inputs.compiler == 'clang'
         uses: actions/cache@v4
         with:
           path: |
@@ -191,15 +196,32 @@ jobs:
             ${{ env.GCC32_DIR }}
           key: aosp-gcc-android-4.9-v1
 
-      # ── 8. Clone GCC ──────────────────────────────────────────────────────
-      - name: ⬇️  Clone AOSP GCC 4.9
-        if: steps.cache_gcc.outputs.cache-hit != 'true'
+      # ── 8. Clone AOSP GCC (Clang builds only) ────────────────────────────
+      - name: ⬇️  Clone AOSP GCC 4.9  (Clang assembler/linker fallback)
+        if: github.event.inputs.compiler == 'clang' && steps.cache_gcc.outputs.cache-hit != 'true'
         run: |
           git clone --depth=1 \
             "$GCC_BASE/aarch64/aarch64-linux-android-4.9.git" "$GCC64_DIR"
           git clone --depth=1 \
             "$GCC_BASE/arm/arm-linux-androideabi-4.9.git"     "$GCC32_DIR"
-          echo "✅ GCC cloned"
+          echo "✅ AOSP GCC cloned"
+
+      # ── 8b. Install apt GCC cross-compilers (GCC builds only) ────────────
+      # gcc-aarch64-linux-gnu / gcc-arm-linux-gnueabihf are 64-bit host
+      # binaries shipped by Ubuntu — no download, no 32-bit lib issues.
+      - name: ⬇️  Install GCC cross-compilers from apt
+        if: github.event.inputs.compiler == 'gcc'
+        run: |
+          sudo apt-get install -y --no-install-recommends \
+            gcc-aarch64-linux-gnu \
+            g++-aarch64-linux-gnu \
+            gcc-arm-linux-gnueabihf \
+            g++-arm-linux-gnueabihf \
+            binutils-aarch64-linux-gnu \
+            binutils-arm-linux-gnueabihf
+          echo "── installed versions ───────────────────────"
+          aarch64-linux-gnu-gcc --version
+          arm-linux-gnueabihf-gcc --version
 
       # ── 9. Restore ccache ─────────────────────────────────────────────────
       - name: 💾 Restore ccache
@@ -271,26 +293,31 @@ jobs:
           echo "KSU_INFO=Yes (v${KSU_VER})" >> "$GITHUB_ENV"
           echo "✅ KernelSU $KSU_VER patched"
 
-      # ── 12. Configure toolchain PATH ──────────────────────────────────────
+      # ── 12. Configure toolchain PATH ─────────────────────────────────────
       - name: 🛠 Configure toolchain PATH
         run: |
           COMPILER="${{ github.event.inputs.compiler || 'clang' }}"
           if [[ "$COMPILER" == "clang" ]]; then
+            # Clang: prepend clang bin, then AOSP GCC bins for assembler/ld
             echo "${CLANG_DIR}/bin" >> "$GITHUB_PATH"
+            echo "${GCC64_DIR}/bin" >> "$GITHUB_PATH"
+            echo "${GCC32_DIR}/bin" >> "$GITHUB_PATH"
           fi
-          echo "${GCC64_DIR}/bin" >> "$GITHUB_PATH"
-          echo "${GCC32_DIR}/bin" >> "$GITHUB_PATH"
-          # Enable ccache
+          # ccache last so it wraps whatever compiler is first in PATH
           echo "/usr/lib/ccache" >> "$GITHUB_PATH"
           ccache --max-size="$CCACHE_MAXSIZE"
           ccache -z
           mkdir -p "$OUT" "$DIST"
 
       # ── 13. Generate make-flags scripts ──────────────────────────────────
-      # Scripts are written with printf to avoid heredoc indentation issues.
-      # Two files:
-      #   /tmp/toolchain_flags.sh  — defines EXTRA_MAKE_FLAGS array + EXTRA_CF
-      #   /tmp/kmake.sh            — defines kmake() that sources the above
+      # Writes two helper scripts sourced by subsequent steps:
+      #   /tmp/toolchain_flags.sh  — EXTRA_MAKE_FLAGS array + EXTRA_CF var
+      #   /tmp/kmake.sh            — kmake() wrapper that sources the above
+      #
+      # Compiler  │ Toolchain              │ CROSS_COMPILE prefix
+      # ──────────┼────────────────────────┼──────────────────────────────
+      # clang     │ Google Clang + AOSP GCC│ aarch64-linux-android-
+      # gcc       │ apt gcc-aarch64-linux-gnu│ aarch64-linux-gnu-
       - name: ⚙️  Generate make-flags scripts
         run: |
           COMPILER="${{ github.event.inputs.compiler || 'clang' }}"
@@ -300,74 +327,87 @@ jobs:
           EXTRA_CF=""
           [[ "$BUILD_TYPE" == "debug" ]] && EXTRA_CF="-g"
 
-          # ── toolchain_flags.sh ──────────────────────────────────────────
           if [[ "$COMPILER" == "clang" ]]; then
+            # ── Clang: full LLVM stack ─────────────────────────────────
+            LTO_ENTRY=""
+            [[ "$LTO" == "thin" ]] && LTO_ENTRY="  LTO=thin"
+            [[ "$LTO" == "full" ]] && LTO_ENTRY="  LTO=full"
 
-            LTO_LINE=""
-            [[ "$LTO" == "thin" ]] && LTO_LINE='  LTO=thin'
-            [[ "$LTO" == "full" ]] && LTO_LINE='  LTO=full'
-
-            printf '%s\n' \
-              '#!/usr/bin/env bash' \
-              'EXTRA_MAKE_FLAGS=(' \
-              '  CC=clang' \
-              '  CLANG_TRIPLE=aarch64-linux-gnu-' \
-              '  LD=ld.lld' \
-              '  AR=llvm-ar' \
-              '  NM=llvm-nm' \
-              '  OBJCOPY=llvm-objcopy' \
-              '  OBJDUMP=llvm-objdump' \
-              '  STRIP=llvm-strip' \
-              '  HOSTCC=clang' \
-              '  HOSTCXX=clang++' \
-              '  HOSTLD=ld.lld' \
-              '  HOSTAR=llvm-ar' \
-              "${LTO_LINE:+  ${LTO_LINE}}" \
-              ')' \
-              "EXTRA_CF=\"${EXTRA_CF}\"" \
-            > /tmp/toolchain_flags.sh
+            {
+              echo '#!/usr/bin/env bash'
+              echo 'EXTRA_MAKE_FLAGS=('
+              echo '  CC=clang'
+              echo '  CLANG_TRIPLE=aarch64-linux-gnu-'
+              echo '  LD=ld.lld'
+              echo '  AR=llvm-ar'
+              echo '  NM=llvm-nm'
+              echo '  OBJCOPY=llvm-objcopy'
+              echo '  OBJDUMP=llvm-objdump'
+              echo '  STRIP=llvm-strip'
+              echo '  HOSTCC=clang'
+              echo '  HOSTCXX=clang++'
+              echo '  HOSTLD=ld.lld'
+              echo '  HOSTAR=llvm-ar'
+              [[ -n "$LTO_ENTRY" ]] && echo "$LTO_ENTRY"
+              echo ')'
+              echo "EXTRA_CF=\"${EXTRA_CF}\""
+              echo 'CC64=aarch64-linux-android-'
+              echo 'CC32=arm-linux-androideabi-'
+            } > /tmp/toolchain_flags.sh
 
           else
-            # Pure GCC — CROSS_COMPILE uses full path so the prefix is always
-            # found regardless of PATH ordering. HOSTCC/HOSTCXX stay as the
-            # system gcc/g++ (correct for GCC kernel builds).
-            printf '%s\n' \
-              '#!/usr/bin/env bash' \
-              "EXTRA_MAKE_FLAGS=(" \
-              "  CROSS_COMPILE=${GCC64_DIR}/bin/aarch64-linux-android-" \
-              "  CROSS_COMPILE_ARM32=${GCC32_DIR}/bin/arm-linux-androideabi-" \
-              "  HOSTCC=gcc" \
-              "  HOSTCXX=g++" \
-              ")" \
-              "EXTRA_CF=\"${EXTRA_CF}\"" \
-            > /tmp/toolchain_flags.sh
+            # ── Pure GCC: apt gcc-aarch64-linux-gnu ───────────────────
+            # Prefix is aarch64-linux-gnu- (Ubuntu apt package naming).
+            # HOSTCC/HOSTCXX = system gcc/g++ — correct for GCC kernel builds.
+            # No LTO: CAF msm-4.4 doesn't support GCC LTO.
+            {
+              echo '#!/usr/bin/env bash'
+              echo 'EXTRA_MAKE_FLAGS=('
+              echo '  HOSTCC=gcc'
+              echo '  HOSTCXX=g++'
+              echo '  HOSTLD=ld'
+              echo '  HOSTAR=ar'
+              echo ')'
+              echo "EXTRA_CF=\"${EXTRA_CF}\""
+              echo 'CC64=aarch64-linux-gnu-'
+              echo 'CC32=arm-linux-gnueabihf-'
+            } > /tmp/toolchain_flags.sh
           fi
 
-          # ── kmake.sh ────────────────────────────────────────────────────
-          # For Clang: CROSS_COMPILE uses short prefix (resolved via PATH).
-          # For GCC:   CROSS_COMPILE is overridden by EXTRA_MAKE_FLAGS above.
-          printf '%s\n' \
-            '#!/usr/bin/env bash' \
-            'source /tmp/toolchain_flags.sh' \
-            'kmake() {' \
-            '  make -j"$(nproc --all)" \' \
-            '    O="$OUT" \' \
-            '    ARCH=arm64 \' \
-            '    SUBARCH=arm64 \' \
-            '    CROSS_COMPILE=aarch64-linux-android- \' \
-            '    CROSS_COMPILE_ARM32=arm-linux-androideabi- \' \
-            '    "${EXTRA_MAKE_FLAGS[@]}" \' \
-            '    KCFLAGS="$EXTRA_CF" \' \
-            '    "$@"' \
-            '}' \
-          > /tmp/kmake.sh
+          # ── kmake.sh: reads CC64/CC32 from toolchain_flags.sh ─────────
+          {
+            echo '#!/usr/bin/env bash'
+            echo 'source /tmp/toolchain_flags.sh'
+            echo 'kmake() {'
+            echo '  make -j"$(nproc --all)" \'
+            echo '    O="$OUT" \'
+            echo '    ARCH=arm64 \'
+            echo '    SUBARCH=arm64 \'
+            echo '    CROSS_COMPILE="$CC64" \'
+            echo '    CROSS_COMPILE_ARM32="$CC32" \'
+            echo '    "${EXTRA_MAKE_FLAGS[@]}" \'
+            echo '    KCFLAGS="$EXTRA_CF" \'
+            echo '    "$@"'
+            echo '}'
+          } > /tmp/kmake.sh
 
           chmod +x /tmp/toolchain_flags.sh /tmp/kmake.sh
 
-          echo "── toolchain_flags.sh ──────────────────────"
+          echo "── toolchain_flags.sh ──────────────────────────"
           cat /tmp/toolchain_flags.sh
-          echo "── kmake.sh ────────────────────────────────"
+          echo "── kmake.sh ────────────────────────────────────"
           cat /tmp/kmake.sh
+
+          # Verify compilers are actually reachable
+          echo "── compiler sanity check ───────────────────────"
+          source /tmp/toolchain_flags.sh
+          if [[ "$COMPILER" == "clang" ]]; then
+            which clang && clang --version | head -1
+            which "${CC64}gcc" && "${CC64}gcc" --version | head -1
+          else
+            which "${CC64}gcc" && "${CC64}gcc" --version | head -1
+            which "${CC32}gcc" && "${CC32}gcc" --version | head -1
+          fi
 
       # ── 14. Load defconfig ────────────────────────────────────────────────
       - name: 📋 Load defconfig — ${{ env.DEFCONFIG }}
