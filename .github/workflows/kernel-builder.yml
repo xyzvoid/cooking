@@ -24,8 +24,15 @@ on:
         type: choice
         options: [ release, debug ]
 
+      compiler:
+        description: '🛠 Compiler'
+        required: true
+        default: clang
+        type: choice
+        options: [ clang, gcc ]
+
       lto:
-        description: '⚡ Link-Time Optimisation'
+        description: '⚡ LTO  (Clang only — ignored for GCC)'
         required: true
         default: thin
         type: choice
@@ -138,6 +145,7 @@ jobs:
           📱 Device    : <code>${{ env.DEVICE }} (SDM660)</code>
           🌿 Branch    : <code>${{ env.KERNEL_BRANCH }}</code>
           🏷 Type      : <code>${{ github.event.inputs.build_type  || 'release' }}</code>
+          🛠 Compiler  : <code>${{ github.event.inputs.compiler    || 'clang'   }}</code>
           ⚡ LTO       : <code>${{ github.event.inputs.lto         || 'thin'    }}</code>
           🔑 KernelSU  : <code>${{ github.event.inputs.kernelsu    || 'false'   }}</code>
           📋 Defconfig : <code>${{ env.DEFCONFIG }}</code>
@@ -168,6 +176,7 @@ jobs:
       # ── 5. Resolve latest Google Clang ──────────────────────────────────
       - name: 🔍 Resolve latest Google Clang version
         id: clang_ver
+        if: github.event.inputs.compiler == 'clang'
         run: |
           LATEST=$(curl -sf \
             "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+/refs/heads/main/?format=JSON" \
@@ -186,6 +195,7 @@ jobs:
       # ── 6. Cache Clang ──────────────────────────────────────────────────
       - name: 💾 Cache Clang
         id: cache_clang
+        if: github.event.inputs.compiler == 'clang'
         uses: actions/cache@v4
         with:
           path: ${{ env.CLANG_DIR }}
@@ -193,7 +203,7 @@ jobs:
 
       # ── 7. Download Clang (if not cached) ───────────────────────────────
       - name: ⬇️  Download Google Clang
-        if: steps.cache_clang.outputs.cache-hit != 'true'
+        if: github.event.inputs.compiler == 'clang' && steps.cache_clang.outputs.cache-hit != 'true'
         run: |
           VER="${{ steps.clang_ver.outputs.version }}"
           mkdir -p "$CLANG_DIR"
@@ -267,20 +277,61 @@ jobs:
           echo "KSU_VERSION=$KSU_VER" >> "$GITHUB_ENV"
           echo "✅ KernelSU $KSU_VER patched"
 
-      # ── 13. Configure toolchain PATH + LTO ─────────────────────────────
+      # ── 13. Configure toolchain PATH + make flags ──────────────────────
       - name: 🛠 Configure build environment
         run: |
-          printf '%s\n' \
-            "${CLANG_DIR}/bin" \
-            "${GCC64_DIR}/bin" \
-            "${GCC32_DIR}/bin" \
-          >> "$GITHUB_PATH"
+          COMPILER="${{ github.event.inputs.compiler || 'clang' }}"
 
-          case "${{ github.event.inputs.lto || 'thin' }}" in
-            thin) echo "LTO_FLAGS=LTO=thin" >> "$GITHUB_ENV" ;;
-            full) echo "LTO_FLAGS=LTO=full" >> "$GITHUB_ENV" ;;
-            none) echo "LTO_FLAGS="         >> "$GITHUB_ENV" ;;
-          esac
+          if [[ "$COMPILER" == "clang" ]]; then
+            # ── Clang + LLVM full stack ──────────────────────────────────
+            printf '%s\n' \
+              "${CLANG_DIR}/bin" \
+              "${GCC64_DIR}/bin" \
+              "${GCC32_DIR}/bin" \
+            >> "$GITHUB_PATH"
+
+            # LTO (Clang only)
+            case "${{ github.event.inputs.lto || 'thin' }}" in
+              thin) LTO_FLAGS="LTO=thin" ;;
+              full) LTO_FLAGS="LTO=full" ;;
+              none) LTO_FLAGS=""         ;;
+            esac
+
+            MAKE_FLAGS="CC=clang \
+              CLANG_TRIPLE=aarch64-linux-gnu- \
+              CROSS_COMPILE=aarch64-linux-android- \
+              CROSS_COMPILE_ARM32=arm-linux-androideabi- \
+              LD=ld.lld \
+              AR=llvm-ar \
+              NM=llvm-nm \
+              OBJCOPY=llvm-objcopy \
+              OBJDUMP=llvm-objdump \
+              STRIP=llvm-strip \
+              HOSTCC=clang \
+              HOSTCXX=clang++ \
+              HOSTLD=ld.lld \
+              HOSTAR=llvm-ar"
+
+            echo "TOOLCHAIN_LABEL=Google Clang ${{ steps.clang_ver.outputs.version }}" >> "$GITHUB_ENV"
+
+          else
+            # ── Pure GCC (aarch64-linux-android-4.9) ────────────────────
+            printf '%s\n' \
+              "${GCC64_DIR}/bin" \
+              "${GCC32_DIR}/bin" \
+            >> "$GITHUB_PATH"
+
+            LTO_FLAGS=""   # GCC LTO not supported in CAF 4.4
+
+            MAKE_FLAGS="CROSS_COMPILE=aarch64-linux-android- \
+              CROSS_COMPILE_ARM32=arm-linux-androideabi-"
+
+            echo "TOOLCHAIN_LABEL=AOSP GCC aarch64-linux-android-4.9" >> "$GITHUB_ENV"
+          fi
+
+          echo "LTO_FLAGS=$LTO_FLAGS"   >> "$GITHUB_ENV"
+          echo "MAKE_FLAGS=$MAKE_FLAGS" >> "$GITHUB_ENV"
+          echo "COMPILER=$COMPILER"     >> "$GITHUB_ENV"
 
           [[ "${{ github.event.inputs.build_type || 'release' }}" == "debug" ]] \
             && echo "EXTRA_CFLAGS=-g" >> "$GITHUB_ENV" \
@@ -288,18 +339,16 @@ jobs:
 
           mkdir -p "$OUT" "$DIST"
 
+          echo "Compiler : $COMPILER"
+          echo "LTO      : $LTO_FLAGS"
+
       # ── 14. Load defconfig ──────────────────────────────────────────────
       - name: 📋 Load defconfig — ${{ env.DEFCONFIG }}
         working-directory: kernel
         run: |
           make \
             O="$OUT" ARCH=arm64 SUBARCH=arm64 \
-            CC=clang CLANG_TRIPLE=aarch64-linux-gnu- \
-            CROSS_COMPILE=aarch64-linux-android- \
-            CROSS_COMPILE_ARM32=arm-linux-androideabi- \
-            LD=ld.lld AR=llvm-ar NM=llvm-nm \
-            OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip \
-            HOSTCC=clang HOSTCXX=clang++ HOSTLD=ld.lld HOSTAR=llvm-ar \
+            $MAKE_FLAGS \
             "$DEFCONFIG"
 
       # ── 15. Compile ─────────────────────────────────────────────────────
@@ -309,16 +358,11 @@ jobs:
         run: |
           set -o pipefail
           JOBS=$(nproc --all)
-          echo "▶ make  jobs=$JOBS  lto=$LTO_FLAGS"
+          echo "▶ make  jobs=$JOBS  compiler=$COMPILER  lto=$LTO_FLAGS"
 
           make \
             O="$OUT" ARCH=arm64 SUBARCH=arm64 \
-            CC=clang CLANG_TRIPLE=aarch64-linux-gnu- \
-            CROSS_COMPILE=aarch64-linux-android- \
-            CROSS_COMPILE_ARM32=arm-linux-androideabi- \
-            LD=ld.lld AR=llvm-ar NM=llvm-nm \
-            OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip \
-            HOSTCC=clang HOSTCXX=clang++ HOSTLD=ld.lld HOSTAR=llvm-ar \
+            $MAKE_FLAGS \
             $LTO_FLAGS \
             KCFLAGS="$EXTRA_CFLAGS" \
             -j"$JOBS" \
@@ -460,10 +504,10 @@ jobs:
             ### 🧰 Toolchain
             | Tool | Details |
             |------|---------|
-            | Clang | `${{ steps.clang_ver.outputs.version }}` (Google AOSP) |
+            | Compiler | `${{ env.TOOLCHAIN_LABEL }}` |
             | GCC aarch64 | `aarch64-linux-android-4.9` |
             | GCC arm32 | `arm-linux-androideabi-4.9` |
-            | LTO | `${{ github.event.inputs.lto || 'thin' }}` |
+            | LTO | `${{ github.event.inputs.compiler == 'clang' && github.event.inputs.lto || 'n/a (GCC)' }}` |
             | KernelSU | `${{ github.event.inputs.kernelsu == 'true' && env.KSU_VERSION || 'No' }}` |
 
             ### 📝 Commit
@@ -502,7 +546,7 @@ jobs:
           📱 <b>${{ env.DEVICE }}</b> · SDM660
           🔖 Tag      : <code>${TAG}</code>
           🐧 Version  : <code>$KERNEL_VERSION</code>
-          🔨 Clang    : <code>${{ steps.clang_ver.outputs.version }}</code>
+          🛠 Compiler : <code>$TOOLCHAIN_LABEL</code>
           ⚡ LTO      : <code>${{ github.event.inputs.lto || 'thin' }}</code>
           🔑 KernelSU : <code>${{ github.event.inputs.kernelsu == 'true' && env.KSU_VERSION || 'No' }}</code>
           📝 Commit   : <code>$KERNEL_COMMIT</code>
@@ -595,10 +639,10 @@ jobs:
           ### 🧰 Toolchain
           | Component | Details |
           |-----------|---------|
-          | Clang | \`${{ steps.clang_ver.outputs.version }}\` |
+          | Compiler | \`$TOOLCHAIN_LABEL\` |
           | GCC aarch64 | \`aarch64-linux-android-4.9\` |
           | GCC arm32 | \`arm-linux-androideabi-4.9\` |
-          | LTO | \`${{ github.event.inputs.lto || 'thin' }}\` |
+          | LTO | \`$LTO_FLAGS\` |
           | KernelSU | \`${{ github.event.inputs.kernelsu == 'true' && env.KSU_VERSION || 'No' }}\` |
 
           ### 🐧 Kernel
