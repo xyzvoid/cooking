@@ -25,10 +25,10 @@
 name: Build Kernel
 
 # Dynamic run title shown in the Actions tab run list
-run-name: "Kernel · ${{ github.event.inputs.compiler || 'gcc-4.9' }} · by @${{ github.actor }}"
+run-name: "Kernel · ${{ github.event.inputs.compiler || 'gcc-4.9' }} · branch: ${{ github.event.inputs.kernel_branch_custom || github.event.inputs.kernel_branch || 'main' }} · by @${{ github.actor }}"
 
 on:
-  # ── Manual trigger with compiler selector ────────────────────────────────────
+  # ── Manual trigger with compiler + branch selector ───────────────────────────
   workflow_dispatch:
     inputs:
       compiler:
@@ -39,6 +39,25 @@ on:
         options:
           - gcc-4.9
           - gcc-latest
+
+      kernel_branch:
+        description: "Kernel branch (pick from list)"
+        required: false
+        default: main
+        type: choice
+        options:
+          - main
+          - master
+          - staging
+          - development
+          - testing
+          - stable
+
+      kernel_branch_custom:
+        description: "Custom kernel branch (overrides the picker above if set)"
+        required: false
+        default: ""
+        type: string
 
   # ── Automatic on push to tracked branches ────────────────────────────────────
   push:
@@ -59,7 +78,6 @@ permissions:
 # ── Path constants (workspace-relative; expand to absolute at runtime) ──────────
 env:
   KERNEL_REPO:    xyzvoid/msm-4.4
-  KERNEL_BRANCH:  main
   AK3_REPO:       xyzvoid/AnyKernel3
   AK3_BRANCH:     master
   DEFCONFIG:      X00TD_defconfig
@@ -79,7 +97,6 @@ jobs:
     name: "Build · ${{ github.event.inputs.compiler || 'gcc-4.9' }}"
 
     # ubuntu-latest → ubuntu-24.04 (GA since 2025-01-17)
-    # Pinned explicitly so a future ubuntu-latest bump never surprises us
     runs-on: ubuntu-24.04
     timeout-minutes: 90
 
@@ -94,11 +111,11 @@ jobs:
 
     steps:
 
-      # ── 0. Resolve compiler choice ─────────────────────────────────────────
-      - name: Resolve compiler choice
+      # ── 0. Resolve compiler + branch choice ───────────────────────────────
+      - name: Resolve compiler and branch
         id: cfg
         run: |
-          # Fall back to gcc-4.9 when triggered by push (no inputs)
+          # ── Compiler ──────────────────────────────────────────────────────
           COMPILER="${{ github.event.inputs.compiler }}"
           COMPILER="${COMPILER:-gcc-4.9}"
           echo "compiler=${COMPILER}" >> "$GITHUB_OUTPUT"
@@ -109,14 +126,40 @@ jobs:
             echo "compiler_tag=GCC-Latest-ARM" >> "$GITHUB_OUTPUT"
           fi
 
+          # ── Branch resolution (priority order) ────────────────────────────
+          #   1. Free-text custom input  (kernel_branch_custom)  — highest priority
+          #   2. Dropdown picker         (kernel_branch)
+          #   3. The git ref that triggered a push event         (GITHUB_REF_NAME)
+          #   4. Hard-coded fallback: main
+          CUSTOM="${{ github.event.inputs.kernel_branch_custom }}"
+          CUSTOM="$(echo "${CUSTOM}" | xargs)"   # trim whitespace
+
+          if [[ -n "${CUSTOM}" ]]; then
+            BRANCH="${CUSTOM}"
+            BRANCH_SOURCE="custom-input"
+          elif [[ -n "${{ github.event.inputs.kernel_branch }}" ]]; then
+            BRANCH="${{ github.event.inputs.kernel_branch }}"
+            BRANCH_SOURCE="dropdown"
+          elif [[ -n "${GITHUB_REF_NAME}" ]]; then
+            BRANCH="${GITHUB_REF_NAME}"
+            BRANCH_SOURCE="push-trigger"
+          else
+            BRANCH="main"
+            BRANCH_SOURCE="fallback"
+          fi
+
+          echo "branch=${BRANCH}"               >> "$GITHUB_OUTPUT"
+          echo "branch_source=${BRANCH_SOURCE}" >> "$GITHUB_OUTPUT"
+          echo "✅ Using branch '${BRANCH}' (source: ${BRANCH_SOURCE})"
+
       # ── 1. Telegram – build started ─────────────────────────────────────────
       - name: "Telegram · Build started"
-        # A Telegram outage must never block a kernel build
         continue-on-error: true
         run: |
           TEXT=$(printf '%s\n' \
             "🔨 *Kernel build started*" \
             "• Repo: \`${KERNEL_REPO}\`" \
+            "• Branch: \`${{ steps.cfg.outputs.branch }}\`" \
             "• Defconfig: \`${DEFCONFIG}\`" \
             "• Compiler: \`${{ steps.cfg.outputs.compiler_tag }}\`" \
             "• Triggered by: \`${{ github.actor }}\`" \
@@ -141,18 +184,16 @@ jobs:
             gcc-arm-linux-gnueabihf binutils-arm-linux-gnueabihf
 
       # ── 3. Checkout kernel source ────────────────────────────────────────────
-      # actions/checkout v6.0.2 (2026-01-09) — latest as of March 2026
       - name: Checkout kernel source
         uses: actions/checkout@v4
         with:
           repository: ${{ env.KERNEL_REPO }}
-          ref:        ${{ env.KERNEL_BRANCH }}
+          ref:        ${{ steps.cfg.outputs.branch }}
           token:      ${{ secrets.GH_PAT }}
           path:       kernel
           fetch-depth: 1
 
       # ── 4. Checkout AnyKernel3 ───────────────────────────────────────────────
-      # actions/checkout v6.0.2
       - name: Checkout AnyKernel3
         uses: actions/checkout@v4
         with:
@@ -166,12 +207,10 @@ jobs:
       - name: "Set up toolchain · GCC 4.9 (AOSP)"
         if: steps.cfg.outputs.compiler == 'gcc-4.9'
         run: |
-          # arm64 cross compiler
           git clone --depth=1 \
             "https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_aarch64_aarch64-linux-android-4.9.git" \
             "$GCC49_DIR"
 
-          # arm32 cross compiler — required by msm-4.4 compat vDSO
           git clone --depth=1 \
             "https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_arm_arm-linux-androideabi-4.9.git" \
             "$GCC49_ARM32_DIR"
@@ -212,8 +251,6 @@ jobs:
           rm /tmp/gcc-a32.tar.xz
 
       # ── 6. Expose toolchain to all later steps ───────────────────────────────
-      #   $GITHUB_PATH  → prepends a dir to PATH (replaces deprecated ::add-path::)
-      #   $GITHUB_ENV   → sets a persistent env var (replaces deprecated ::set-env::)
       - name: Export toolchain environment
         run: |
           if [[ "${{ steps.cfg.outputs.compiler }}" == "gcc-4.9" ]]; then
@@ -228,15 +265,12 @@ jobs:
             TC32_PREFIX="${TC32_BIN}/arm-none-linux-gnueabihf-"
           fi
 
-          # Prepend both toolchain bin dirs to PATH
           echo "${TC64_BIN}" >> "$GITHUB_PATH"
           echo "${TC32_BIN}" >> "$GITHUB_PATH"
 
-          # Persist cross-compile prefixes for all subsequent steps
           echo "CROSS_COMPILE=${TC64_PREFIX}"       >> "$GITHUB_ENV"
           echo "CROSS_COMPILE_ARM32=${TC32_PREFIX}" >> "$GITHUB_ENV"
 
-          # Fail early if either compiler binary is missing
           "${TC64_PREFIX}gcc" --version \
             || { echo "❌ arm64 compiler not found: ${TC64_PREFIX}gcc"; exit 1; }
           "${TC32_PREFIX}gcc" --version \
@@ -252,7 +286,6 @@ jobs:
 
           BUILD_START=$(date +%s)
 
-          # Generate .config
           make -s \
             O="$OUT_DIR" \
             ARCH="$ARCH" \
@@ -261,7 +294,6 @@ jobs:
             CROSS_COMPILE_ARM32="$CROSS_COMPILE_ARM32" \
             "$DEFCONFIG" 2>&1 | tee "$OUT_DIR/defconfig.log"
 
-          # Parallel build using all available vCPUs
           make \
             O="$OUT_DIR" \
             ARCH="$ARCH" \
@@ -294,7 +326,6 @@ jobs:
         run: |
           cp "${{ steps.image.outputs.path }}" "$AK3_DIR/"
 
-          # Parse version triple from the kernel top-level Makefile in one pass
           KVER=$(awk '
             /^VERSION/    { v=$3 }
             /^PATCHLEVEL/ { p=$3 }
@@ -306,31 +337,37 @@ jobs:
           COMPILER_SLUG=$(echo "${{ steps.cfg.outputs.compiler_tag }}" \
             | tr '[:upper:]' '[:lower:]' | tr ' ' '-')
 
-          ZIP_NAME="kernel-${KVER}-X00TD-${COMPILER_SLUG}-${DATE}.zip"
+          # Sanitise the branch name so it's safe to embed in a filename
+          # (replace slashes and special chars with dashes)
+          BRANCH_SLUG=$(echo "${{ steps.cfg.outputs.branch }}" \
+            | sed 's|[^a-zA-Z0-9._-]|-|g')
+
+          ZIP_NAME="kernel-${KVER}-X00TD-${BRANCH_SLUG}-${COMPILER_SLUG}-${DATE}.zip"
           ZIP_PATH="${{ github.workspace }}/${ZIP_NAME}"
 
           cd "$AK3_DIR"
           zip -r9 "${ZIP_PATH}" . \
             -x "*.git*" -x "*.github*" -x "LICENCE" -x "README.md"
 
-          echo "path=${ZIP_PATH}" >> "$GITHUB_OUTPUT"
-          echo "name=${ZIP_NAME}" >> "$GITHUB_OUTPUT"
-          echo "kver=${KVER}"     >> "$GITHUB_OUTPUT"
-          echo "date=${DATE}"     >> "$GITHUB_OUTPUT"
+          echo "path=${ZIP_PATH}"         >> "$GITHUB_OUTPUT"
+          echo "name=${ZIP_NAME}"         >> "$GITHUB_OUTPUT"
+          echo "kver=${KVER}"             >> "$GITHUB_OUTPUT"
+          echo "date=${DATE}"             >> "$GITHUB_OUTPUT"
+          echo "branch_slug=${BRANCH_SLUG}" >> "$GITHUB_OUTPUT"
           echo "Packaged: ${ZIP_NAME}"
 
       # ── 10. Create GitHub Release ────────────────────────────────────────────
-      # softprops/action-gh-release v2.5.0 (2025-12-01)
       - name: Create GitHub Release
         id: release
         uses: softprops/action-gh-release@v2
         with:
           token:      ${{ secrets.GH_PAT }}
           repository: ${{ env.KERNEL_REPO }}
-          tag_name:   "v${{ steps.zip.outputs.kver }}-${{ steps.zip.outputs.date }}"
+          tag_name:   "v${{ steps.zip.outputs.kver }}-${{ steps.zip.outputs.branch_slug }}-${{ steps.zip.outputs.date }}"
           name: >-
             Kernel ${{ steps.zip.outputs.kver }}
             · ${{ steps.cfg.outputs.compiler_tag }}
+            · ${{ steps.cfg.outputs.branch }}
             · ${{ steps.zip.outputs.date }}
           body: |
             ## 📦 Kernel ${{ steps.zip.outputs.kver }} — ASUS X00TD
@@ -339,6 +376,7 @@ jobs:
             |---|---|
             | **Device** | ASUS ZenFone Max Pro M1 (X00TD) |
             | **Kernel** | `${{ steps.zip.outputs.kver }}` |
+            | **Branch** | `${{ steps.cfg.outputs.branch }}` |
             | **Defconfig** | `${{ env.DEFCONFIG }}` |
             | **Compiler** | `${{ steps.cfg.outputs.compiler_tag }}` |
             | **Build time** | `${{ steps.build.outputs.duration }}s` |
@@ -356,13 +394,9 @@ jobs:
           prerelease:              false
           generate_release_notes:  false
           fail_on_unmatched_files: true
-          # v2.5.0: marks release as draft while uploading so the asset is
-          # always present before the release becomes visible
           make_latest:             "true"
 
       # ── 11. Upload build log (always, including on failure) ──────────────────
-      # actions/upload-artifact v7.0.0 (2026-02-26, Node 24)
-      # Requires minimum runner version 2.327.1 (all GitHub-hosted runners qualify)
       - name: Upload build log
         if: always()
         uses: actions/upload-artifact@v4
@@ -382,6 +416,7 @@ jobs:
             "✅ *Kernel build succeeded!*" \
             "• Device: \`X00TD\`" \
             "• Kernel: \`${{ steps.zip.outputs.kver }}\`" \
+            "• Branch: \`${{ steps.cfg.outputs.branch }}\`" \
             "• Compiler: \`${{ steps.cfg.outputs.compiler_tag }}\`" \
             "• Build time: \`$(( D / 60 ))m $(( D % 60 ))s\`" \
             "• Release: [View on GitHub](${{ steps.release.outputs.url }})" \
@@ -394,7 +429,6 @@ jobs:
             --data-urlencode "disable_web_page_preview=true" \
             --data-urlencode "text=${TEXT}"
 
-          # Upload the flashable zip directly into Telegram
           curl -sSf --retry 3 --retry-delay 5 -X POST \
             "https://api.telegram.org/bot${{ secrets.TELEGRAM_TOKEN }}/sendDocument" \
             -F "chat_id=${{ secrets.TELEGRAM_CHAT }}" \
@@ -409,6 +443,7 @@ jobs:
           TEXT=$(printf '%s\n' \
             "❌ *Kernel build FAILED*" \
             "• Repo: \`${KERNEL_REPO}\`" \
+            "• Branch: \`${{ steps.cfg.outputs.branch }}\`" \
             "• Compiler: \`${{ steps.cfg.outputs.compiler_tag }}\`" \
             "• Triggered by: \`${{ github.actor }}\`" \
             "• Run: [#${{ github.run_number }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})" \
