@@ -45,6 +45,23 @@ resolve_version_strings() {
     ZIP_NAME="${KERNEL_NAME}-${KERNEL_VERSION}-${DATETIME}.zip"
 }
 
+# ── Detect the best explicit build target for this defconfig ─────────────────
+# CAF 4.4 kernels with CONFIG_BUILD_ARM64_DT_OVERLAY=y add dtbo.img as a
+# dependency of 'all', but the host build system has no rule to produce it.
+# Building Image.gz-dtb (or Image.gz) explicitly bypasses that broken target.
+_get_build_target() {
+    local cfg="${OUT_DIR}/.config"
+    # If .config already exists from the defconfig step, inspect it;
+    # otherwise fall back to Image.gz-dtb which is safe for X00T.
+    if [[ -f "$cfg" ]] && grep -q "^CONFIG_BUILD_ARM64_DT_OVERLAY=y" "$cfg" 2>/dev/null; then
+        log_warn "CONFIG_BUILD_ARM64_DT_OVERLAY=y detected — targeting Image.gz-dtb to skip dtbo.img"
+        echo "Image.gz-dtb"
+    else
+        # Default: build everything; falls back to Image.gz-dtb on failure
+        echo "Image.gz-dtb"
+    fi
+}
+
 # ── Full build ────────────────────────────────────────────────────────────────
 run_build() {
     log_step "Building kernel (defconfig: ${DEFCONFIG})"
@@ -60,11 +77,15 @@ run_build() {
     make $(_make_flags) "$DEFCONFIG" 2>&1 | tee "$BUILD_LOG" \
         || die "defconfig step failed — see ${BUILD_LOG}"
 
-    # Resolve version now (before full build populates out/)
+    # Resolve version now (after defconfig so OUT_DIR/include exists)
     resolve_version_strings
+
+    # Pick explicit build target (avoids broken dtbo.img rule in CAF 4.4)
+    local build_target; build_target=$(_get_build_target)
 
     log_info "Kernel version : ${KERNEL_VERSION}"
     log_info "Output zip     : ${ZIP_NAME}"
+    log_info "Build target   : ${build_target}"
 
     tg_send_or_edit "🔨 *Build in Progress*
 ━━━━━━━━━━━━━━━━━━━
@@ -72,14 +93,15 @@ run_build() {
 🔧 Defconfig: \`${DEFCONFIG}\`
 ⚙️ Toolchain: \`${TOOLCHAIN}\`
 🧵 Jobs     : \`${JOBS}\`
+🎯 Target   : \`${build_target}\`
 🕐 Started  : \`$(date '+%Y-%m-%d %H:%M:%S')\`
 ━━━━━━━━━━━━━━━━━━━
 _Compiling… please wait ⏳_"
 
-    # Full build
-    log "Compiling…"
+    # Full build — explicit target bypasses the dtbo.img dependency
+    log "Compiling (target: ${build_target})…"
     # shellcheck disable=SC2046
-    if ! make $(_make_flags) 2>&1 | tee -a "$BUILD_LOG"; then
+    if ! make $(_make_flags) "$build_target" 2>&1 | tee -a "$BUILD_LOG"; then
         local end; end=$(date +%s)
         BUILD_ELAPSED=$(( end - start ))
         tg_send_or_edit "❌ *Build FAILED* after $(( BUILD_ELAPSED/60 ))m $(( BUILD_ELAPSED%60 ))s"
@@ -91,7 +113,7 @@ _Compiling… please wait ⏳_"
     BUILD_ELAPSED=$(( end - start ))
     log_ok "Build finished in $(( BUILD_ELAPSED/60 ))m $(( BUILD_ELAPSED%60 ))s"
 
-    # Locate kernel image
+    # Locate kernel image (preference order: dtb-appended > gz > plain)
     local img_dtb="${OUT_DIR}/arch/${ARCH}/boot/Image.gz-dtb"
     local img_gz="${OUT_DIR}/arch/${ARCH}/boot/Image.gz"
     local img_plain="${OUT_DIR}/arch/${ARCH}/boot/Image"
