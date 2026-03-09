@@ -1,0 +1,232 @@
+name: 🔨 Build Kernel
+
+on:
+  # ── Manual trigger with inputs ──────────────────────────────────────────────
+  workflow_dispatch:
+    inputs:
+      toolchain:
+        description: "Toolchain"
+        required: true
+        default: "gcc49"
+        type: choice
+        options:
+          - gcc49
+          - gcc_latest
+      defconfig:
+        description: "Defconfig"
+        required: true
+        default: "X00T_defconfig"
+        type: string
+      clean_build:
+        description: "Run mrproper before build"
+        required: false
+        default: false
+        type: boolean
+      upload_telegram:
+        description: "Upload artifacts to Telegram"
+        required: false
+        default: true
+        type: boolean
+      create_release:
+        description: "Create GitHub release"
+        required: false
+        default: true
+        type: boolean
+
+  # ── Push to these branches triggers a build ──────────────────────────────────
+  push:
+    branches:
+      - android-4.4
+      - main
+    paths-ignore:
+      - "**.md"
+      - ".github/ISSUE_TEMPLATE/**"
+      - "Documentation/**"
+
+  # ── Allow PRs to trigger a test build (no release/upload) ───────────────────
+  pull_request:
+    branches:
+      - android-4.4
+    paths-ignore:
+      - "**.md"
+
+# ── Prevent concurrent builds on the same ref ─────────────────────────────────
+concurrency:
+  group: kernel-build-${{ github.ref }}
+  cancel-in-progress: true
+
+# ── Global env ────────────────────────────────────────────────────────────────
+env:
+  KERNEL_NAME: xyzvoid
+  DEFCONFIG: ${{ github.event.inputs.defconfig || 'X00T_defconfig' }}
+  TOOLCHAIN: ${{ github.event.inputs.toolchain || 'gcc49' }}
+
+jobs:
+  # ════════════════════════════════════════════════════════════════════════════
+  build:
+    name: Build (${{ github.event.inputs.toolchain || 'gcc49' }})
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+
+    outputs:
+      zip_name:        ${{ steps.meta.outputs.zip_name }}
+      kernel_version:  ${{ steps.meta.outputs.kernel_version }}
+      build_elapsed:   ${{ steps.meta.outputs.build_elapsed }}
+
+    steps:
+      # ── Checkout builder repo ───────────────────────────────────────────────
+      - name: 📥 Checkout builder
+        uses: actions/checkout@v4
+        with:
+          path: builder
+
+      # ── Free extra disk space (GitHub runners have ~14 GB free) ─────────────
+      - name: 🗑 Free disk space
+        run: |
+          df -h
+          sudo rm -rf \
+            /usr/share/dotnet \
+            /usr/local/lib/android \
+            /opt/ghc \
+            /opt/hostedtoolcache/CodeQL \
+            "$AGENT_TOOLSDIRECTORY" \
+            || true
+          sudo apt-get clean -qq
+          df -h
+
+      # ── Cache toolchains ────────────────────────────────────────────────────
+      - name: 💾 Cache toolchains
+        uses: actions/cache@v4
+        with:
+          path: build/toolchains
+          key: toolchain-${{ env.TOOLCHAIN }}-${{ runner.os }}-v1
+          restore-keys: |
+            toolchain-${{ env.TOOLCHAIN }}-${{ runner.os }}-
+
+      # ── Cache kernel sources ────────────────────────────────────────────────
+      - name: 💾 Cache kernel sources
+        uses: actions/cache@v4
+        with:
+          path: build/msm-4.4
+          key: kernel-src-${{ hashFiles('builder/config/build.conf') }}-${{ github.sha }}
+          restore-keys: |
+            kernel-src-${{ hashFiles('builder/config/build.conf') }}-
+
+      # ── Cache AnyKernel3 ────────────────────────────────────────────────────
+      - name: 💾 Cache AnyKernel3
+        uses: actions/cache@v4
+        with:
+          path: build/AnyKernel3
+          key: anykernel3-${{ github.sha }}
+          restore-keys: |
+            anykernel3-
+
+      # ── Cache ccache ────────────────────────────────────────────────────────
+      - name: 💾 Cache ccache
+        uses: actions/cache@v4
+        with:
+          path: ~/.ccache
+          key: ccache-${{ env.TOOLCHAIN }}-${{ env.DEFCONFIG }}-${{ github.sha }}
+          restore-keys: |
+            ccache-${{ env.TOOLCHAIN }}-${{ env.DEFCONFIG }}-
+            ccache-${{ env.TOOLCHAIN }}-
+
+      # ── Configure ccache ────────────────────────────────────────────────────
+      - name: ⚡ Configure ccache
+        run: |
+          sudo apt-get install -y -qq ccache
+          ccache --max-size=5G
+          ccache --zero-stats
+          echo "PATH=/usr/lib/ccache:$PATH" >> "$GITHUB_ENV"
+
+      # ── Make build.sh executable ────────────────────────────────────────────
+      - name: 🔑 Prepare build script
+        run: |
+          chmod +x builder/build.sh
+          chmod +x builder/lib/*.sh
+
+      # ── Run the build ────────────────────────────────────────────────────────
+      - name: 🔨 Build kernel
+        env:
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID:   ${{ secrets.TG_CHAT_ID }}
+          GH_TOKEN:     ${{ secrets.GH_TOKEN }}
+          BUILD_ROOT:   ${{ github.workspace }}/build
+        run: |
+          cd builder
+
+          ARGS="--toolchain ${{ env.TOOLCHAIN }} --defconfig ${{ env.DEFCONFIG }}"
+
+          # mrproper if requested or on push
+          if [[ "${{ github.event.inputs.clean_build }}" == "true" ]]; then
+            ARGS="$ARGS --mrproper"
+          fi
+
+          # PR builds: no upload, no release
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            ARGS="$ARGS --no-upload --no-github"
+          else
+            [[ "${{ github.event.inputs.upload_telegram }}" == "false" ]] && ARGS="$ARGS --no-upload"
+            [[ "${{ github.event.inputs.create_release  }}" == "false" ]] && ARGS="$ARGS --no-github"
+          fi
+
+          echo "Running: ./build.sh $ARGS"
+          # shellcheck disable=SC2086
+          ./build.sh $ARGS 2>&1 | tee "${BUILD_ROOT}/logs/ci_build.log"
+
+      # ── Extract metadata from .info sidecar ─────────────────────────────────
+      - name: 📊 Extract build metadata
+        id: meta
+        run: |
+          INFO_FILE=$(find build/zips -name "*.info" | head -1)
+          if [[ -f "$INFO_FILE" ]]; then
+            source "$INFO_FILE"
+            echo "zip_name=${zip_name}"         >> "$GITHUB_OUTPUT"
+            echo "kernel_version=${kernel_version}" >> "$GITHUB_OUTPUT"
+            echo "build_elapsed=${build_elapsed}" >> "$GITHUB_OUTPUT"
+          else
+            echo "zip_name=unknown.zip"         >> "$GITHUB_OUTPUT"
+            echo "kernel_version=unknown"       >> "$GITHUB_OUTPUT"
+            echo "build_elapsed=0"              >> "$GITHUB_OUTPUT"
+          fi
+
+      # ── ccache stats ────────────────────────────────────────────────────────
+      - name: 📈 ccache stats
+        if: always()
+        run: ccache --show-stats
+
+      # ── Upload zip as workflow artifact ────────────────────────────────────
+      - name: 📤 Upload ZIP artifact
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ${{ steps.meta.outputs.zip_name || 'kernel.zip' }}
+          path: build/zips/*.zip
+          retention-days: 7
+          if-no-files-found: warn
+
+      # ── Upload build logs as workflow artifact ─────────────────────────────
+      - name: 📋 Upload build logs
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: build-logs-${{ github.run_number }}
+          path: build/logs/
+          retention-days: 7
+          if-no-files-found: ignore
+
+      # ── Print final summary ─────────────────────────────────────────────────
+      - name: 📝 Build summary
+        if: always()
+        run: |
+          echo "## 🔨 Kernel Build Summary" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Field | Value |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|---|---|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Kernel Version | \`${{ steps.meta.outputs.kernel_version }}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| ZIP Name | \`${{ steps.meta.outputs.zip_name }}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Toolchain | \`${{ env.TOOLCHAIN }}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Defconfig | \`${{ env.DEFCONFIG }}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Build Time | ${{ steps.meta.outputs.build_elapsed }}s |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Runner | \`${{ runner.os }} / ${{ runner.arch }}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Triggered By | \`${{ github.event_name }}\` |" >> "$GITHUB_STEP_SUMMARY"
