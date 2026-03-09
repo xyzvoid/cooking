@@ -139,11 +139,17 @@ jobs:
           ccache --zero-stats
           echo "PATH=/usr/lib/ccache:$PATH" >> "$GITHUB_ENV"
 
-      # ── Make build.sh executable ────────────────────────────────────────────
+      # ── Make build.sh executable + pre-create output dirs ───────────────────
       - name: 🔑 Prepare build script
+        env:
+          BUILD_ROOT: ${{ github.workspace }}/build
         run: |
           chmod +x builder/build.sh
           chmod +x builder/lib/*.sh
+          # Pre-create all directories that tee/scripts depend on existing
+          mkdir -p "${BUILD_ROOT}/logs" \
+                   "${BUILD_ROOT}/zips" \
+                   "${BUILD_ROOT}/toolchains"
 
       # ── Run the build ────────────────────────────────────────────────────────
       - name: 🔨 Build kernel
@@ -157,7 +163,7 @@ jobs:
 
           ARGS="--toolchain ${{ env.TOOLCHAIN }} --defconfig ${{ env.DEFCONFIG }}"
 
-          # mrproper if requested or on push
+          # mrproper if requested
           if [[ "${{ github.event.inputs.clean_build }}" == "true" ]]; then
             ARGS="$ARGS --mrproper"
           fi
@@ -171,6 +177,7 @@ jobs:
           fi
 
           echo "Running: ./build.sh $ARGS"
+          # Logs dir is guaranteed to exist from the Prepare step above
           # shellcheck disable=SC2086
           ./build.sh $ARGS 2>&1 | tee "${BUILD_ROOT}/logs/ci_build.log"
 

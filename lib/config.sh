@@ -33,8 +33,8 @@ load_config() {
     GH_RELEASE_BRANCH="${GH_RELEASE_BRANCH:-android-4.4}"
 
     # ── Toolchain repos (gcc49) ───────────────────────────────────────────────
-    TC64_REPO="${TC64_REPO:-https://android.googlesource.com/platform/prebuilts/gcc/linux-x86/aarch64/aarch64-linux-android-4.9}"
-    TC32_REPO="${TC32_REPO:-https://android.googlesource.com/platform/prebuilts/gcc/linux-x86/arm/arm-linux-androideabi-4.9}"
+    TC64_REPO="${TC64_REPO:-https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_aarch64_aarch64-linux-android-4.9}"
+    TC32_REPO="${TC32_REPO:-https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_arm_arm-linux-androideabi-4.9}"
 
     # ── Directory layout ──────────────────────────────────────────────────────
     BUILD_ROOT="${BUILD_ROOT:-$(pwd)/build}"
