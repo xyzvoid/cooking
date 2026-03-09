@@ -46,17 +46,23 @@ _setup_gcc_latest() {
     CROSS_COMPILE="aarch64-linux-gnu-"
     CROSS_COMPILE_ARM32="arm-linux-gnueabihf-"
 
-    # Report actual GCC version
     local ver; ver=$(aarch64-linux-gnu-gcc --version | head -1)
     log_info "GCC version: ${ver}"
 }
 
-# ── Helper: shallow-clone or fetch ───────────────────────────────────────────
+# ── Helper: shallow-clone or fetch, handles stale non-git directories ─────────
 _clone_shallow() {
     local url="$1" dest="$2" label="$3"
+
     if [[ -d "${dest}/.git" ]]; then
-        log_info "${label}: already cloned — skipping"
+        log_info "${label}: cache hit — skipping clone"
     else
+        # Non-git directory (stale cache) — remove before cloning
+        if [[ -d "$dest" ]]; then
+            log_warn "${label}: directory exists but is not a git repo — removing stale cache…"
+            rm -rf "$dest"
+        fi
+
         log "Cloning ${label}…"
         git clone --depth=1 "$url" "$dest" 2>&1 \
             | tee -a "${LOGS_DIR}/toolchain.log" \
