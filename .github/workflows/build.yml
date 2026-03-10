@@ -1,7 +1,7 @@
 name: 🔨 Build Kernel
 
 on:
-  # ── Manual trigger with inputs ──────────────────────────────────────────────
+  # ── Manual trigger ────────────────────────────────────────────────────────
   workflow_dispatch:
     inputs:
       toolchain:
@@ -33,7 +33,7 @@ on:
         default: true
         type: boolean
 
-  # ── Push to these branches triggers a build ──────────────────────────────────
+  # ── Auto-build on push ───────────────────────────────────────────────────
   push:
     branches:
       - android-4.4
@@ -43,44 +43,47 @@ on:
       - ".github/ISSUE_TEMPLATE/**"
       - "Documentation/**"
 
-  # ── Allow PRs to trigger a test build (no release/upload) ───────────────────
+  # ── PR: test build only (no upload / release) ────────────────────────────
   pull_request:
     branches:
       - android-4.4
     paths-ignore:
       - "**.md"
 
-# ── Prevent concurrent builds on the same ref ─────────────────────────────────
+# ── Cancel in-flight builds on the same ref ──────────────────────────────────
 concurrency:
   group: kernel-build-${{ github.ref }}
   cancel-in-progress: true
 
-# ── Global env ────────────────────────────────────────────────────────────────
+# ── Permissions needed to create releases and upload assets ──────────────────
+permissions:
+  contents: write
+
+# ── Global env ───────────────────────────────────────────────────────────────
 env:
   KERNEL_NAME: xyzvoid
   DEFCONFIG: ${{ github.event.inputs.defconfig || 'X00T_defconfig' }}
   TOOLCHAIN: ${{ github.event.inputs.toolchain || 'gcc49' }}
 
 jobs:
-  # ════════════════════════════════════════════════════════════════════════════
   build:
     name: Build (${{ github.event.inputs.toolchain || 'gcc49' }})
     runs-on: ubuntu-22.04
     timeout-minutes: 120
 
     outputs:
-      zip_name:        ${{ steps.meta.outputs.zip_name }}
-      kernel_version:  ${{ steps.meta.outputs.kernel_version }}
-      build_elapsed:   ${{ steps.meta.outputs.build_elapsed }}
+      zip_name:       ${{ steps.meta.outputs.zip_name }}
+      kernel_version: ${{ steps.meta.outputs.kernel_version }}
+      build_elapsed:  ${{ steps.meta.outputs.build_elapsed }}
 
     steps:
-      # ── Checkout builder repo ───────────────────────────────────────────────
+      # ── Checkout builder repo ─────────────────────────────────────────────
       - name: 📥 Checkout builder
         uses: actions/checkout@v4
         with:
           path: builder
 
-      # ── Free extra disk space (GitHub runners have ~14 GB free) ─────────────
+      # ── Free disk space ───────────────────────────────────────────────────
       - name: 🗑 Free disk space
         run: |
           df -h
@@ -89,49 +92,55 @@ jobs:
             /usr/local/lib/android \
             /opt/ghc \
             /opt/hostedtoolcache/CodeQL \
-            "$AGENT_TOOLSDIRECTORY" \
+            "${AGENT_TOOLSDIRECTORY:-}" \
             || true
           sudo apt-get clean -qq
           df -h
 
-      # ── Cache toolchains ────────────────────────────────────────────────────
+      # ── Cache toolchains ──────────────────────────────────────────────────
       - name: 💾 Cache toolchains
         uses: actions/cache@v4
         with:
           path: build/toolchains
+          # Keyed by toolchain type + OS only — toolchain binaries don't change
           key: toolchain-${{ env.TOOLCHAIN }}-${{ runner.os }}-v1
           restore-keys: |
             toolchain-${{ env.TOOLCHAIN }}-${{ runner.os }}-
 
-      # ── Cache kernel sources ────────────────────────────────────────────────
+      # ── Cache kernel sources ──────────────────────────────────────────────
       - name: 💾 Cache kernel sources
         uses: actions/cache@v4
         with:
           path: build/msm-4.4
-          key: kernel-src-${{ hashFiles('builder/config/build.conf') }}-${{ github.sha }}
+          # BUG FIX: was keyed by github.sha (changes every push — useless).
+          # Now keyed by conf hash + branch so the cache is reused across commits.
+          # sources.sh always does fetch+reset to pull the latest HEAD anyway.
+          key: kernel-src-${{ hashFiles('builder/config/build.conf') }}-${{ github.ref_name }}-v1
           restore-keys: |
+            kernel-src-${{ hashFiles('builder/config/build.conf') }}-${{ github.ref_name }}-
             kernel-src-${{ hashFiles('builder/config/build.conf') }}-
 
-      # ── Cache AnyKernel3 ────────────────────────────────────────────────────
+      # ── Cache AnyKernel3 ─────────────────────────────────────────────────
       - name: 💾 Cache AnyKernel3
         uses: actions/cache@v4
         with:
           path: build/AnyKernel3
-          key: anykernel3-${{ github.sha }}
+          key: anykernel3-${{ github.ref_name }}-v1
           restore-keys: |
+            anykernel3-${{ github.ref_name }}-
             anykernel3-
 
-      # ── Cache ccache ────────────────────────────────────────────────────────
+      # ── Cache ccache ─────────────────────────────────────────────────────
       - name: 💾 Cache ccache
         uses: actions/cache@v4
         with:
           path: ~/.ccache
-          key: ccache-${{ env.TOOLCHAIN }}-${{ env.DEFCONFIG }}-${{ github.sha }}
+          key: ccache-${{ env.TOOLCHAIN }}-${{ env.DEFCONFIG }}-${{ github.ref_name }}
           restore-keys: |
             ccache-${{ env.TOOLCHAIN }}-${{ env.DEFCONFIG }}-
             ccache-${{ env.TOOLCHAIN }}-
 
-      # ── Configure ccache ────────────────────────────────────────────────────
+      # ── Configure ccache ─────────────────────────────────────────────────
       - name: ⚡ Configure ccache
         run: |
           sudo apt-get install -y -qq ccache
@@ -139,19 +148,19 @@ jobs:
           ccache --zero-stats
           echo "PATH=/usr/lib/ccache:$PATH" >> "$GITHUB_ENV"
 
-      # ── Make build.sh executable + pre-create output dirs ───────────────────
+      # ── Prepare: chmod + pre-create dirs tee writes into ─────────────────
       - name: 🔑 Prepare build script
         env:
           BUILD_ROOT: ${{ github.workspace }}/build
         run: |
-          chmod +x builder/build.sh
-          chmod +x builder/lib/*.sh
-          # Pre-create all directories that tee/scripts depend on existing
+          chmod +x builder/build.sh builder/lib/*.sh
+          # Pre-create dirs that tee and early script steps write to.
+          # Do NOT create msm-4.4 or AnyKernel3 — git clone must do that.
           mkdir -p "${BUILD_ROOT}/logs" \
                    "${BUILD_ROOT}/zips" \
                    "${BUILD_ROOT}/toolchains"
 
-      # ── Run the build ────────────────────────────────────────────────────────
+      # ── Build ────────────────────────────────────────────────────────────
       - name: 🔨 Build kernel
         env:
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
@@ -163,12 +172,9 @@ jobs:
 
           ARGS="--toolchain ${{ env.TOOLCHAIN }} --defconfig ${{ env.DEFCONFIG }}"
 
-          # mrproper if requested
-          if [[ "${{ github.event.inputs.clean_build }}" == "true" ]]; then
-            ARGS="$ARGS --mrproper"
-          fi
+          [[ "${{ github.event.inputs.clean_build }}" == "true" ]] && ARGS="$ARGS --mrproper"
 
-          # PR builds: no upload, no release
+          # PR builds: test only — no Telegram upload, no GitHub release
           if [[ "${{ github.event_name }}" == "pull_request" ]]; then
             ARGS="$ARGS --no-upload --no-github"
           else
@@ -177,42 +183,43 @@ jobs:
           fi
 
           echo "Running: ./build.sh $ARGS"
-          # Logs dir is guaranteed to exist from the Prepare step above
           # shellcheck disable=SC2086
           ./build.sh $ARGS 2>&1 | tee "${BUILD_ROOT}/logs/ci_build.log"
 
-      # ── Extract metadata from .info sidecar ─────────────────────────────────
+      # ── Extract metadata ─────────────────────────────────────────────────
       - name: 📊 Extract build metadata
         id: meta
+        if: always()
         run: |
-          INFO_FILE=$(find build/zips -name "*.info" | head -1)
-          if [[ -f "$INFO_FILE" ]]; then
+          INFO_FILE=$(find build/zips -name "*.info" 2>/dev/null | head -1 || true)
+          if [[ -f "${INFO_FILE:-}" ]]; then
+            # shellcheck disable=SC1090
             source "$INFO_FILE"
-            echo "zip_name=${zip_name}"         >> "$GITHUB_OUTPUT"
+            echo "zip_name=${zip_name}"             >> "$GITHUB_OUTPUT"
             echo "kernel_version=${kernel_version}" >> "$GITHUB_OUTPUT"
-            echo "build_elapsed=${build_elapsed}" >> "$GITHUB_OUTPUT"
+            echo "build_elapsed=${build_elapsed}"   >> "$GITHUB_OUTPUT"
           else
-            echo "zip_name=unknown.zip"         >> "$GITHUB_OUTPUT"
-            echo "kernel_version=unknown"       >> "$GITHUB_OUTPUT"
-            echo "build_elapsed=0"              >> "$GITHUB_OUTPUT"
+            echo "zip_name=unknown.zip"  >> "$GITHUB_OUTPUT"
+            echo "kernel_version=unknown" >> "$GITHUB_OUTPUT"
+            echo "build_elapsed=0"        >> "$GITHUB_OUTPUT"
           fi
 
-      # ── ccache stats ────────────────────────────────────────────────────────
+      # ── ccache stats ─────────────────────────────────────────────────────
       - name: 📈 ccache stats
         if: always()
         run: ccache --show-stats
 
-      # ── Upload zip as workflow artifact ────────────────────────────────────
+      # ── Upload zip as workflow artifact ───────────────────────────────────
       - name: 📤 Upload ZIP artifact
         uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: ${{ steps.meta.outputs.zip_name || 'kernel.zip' }}
+          name: ${{ steps.meta.outputs.zip_name != '' && steps.meta.outputs.zip_name || 'kernel.zip' }}
           path: build/zips/*.zip
           retention-days: 7
           if-no-files-found: warn
 
-      # ── Upload build logs as workflow artifact ─────────────────────────────
+      # ── Upload build logs as workflow artifact ────────────────────────────
       - name: 📋 Upload build logs
         uses: actions/upload-artifact@v4
         if: always()
@@ -222,18 +229,20 @@ jobs:
           retention-days: 7
           if-no-files-found: ignore
 
-      # ── Print final summary ─────────────────────────────────────────────────
+      # ── Step summary ─────────────────────────────────────────────────────
       - name: 📝 Build summary
         if: always()
         run: |
-          echo "## 🔨 Kernel Build Summary" >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Field | Value |" >> "$GITHUB_STEP_SUMMARY"
-          echo "|---|---|" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Kernel Version | \`${{ steps.meta.outputs.kernel_version }}\` |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| ZIP Name | \`${{ steps.meta.outputs.zip_name }}\` |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Toolchain | \`${{ env.TOOLCHAIN }}\` |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Defconfig | \`${{ env.DEFCONFIG }}\` |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Build Time | ${{ steps.meta.outputs.build_elapsed }}s |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Runner | \`${{ runner.os }} / ${{ runner.arch }}\` |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Triggered By | \`${{ github.event_name }}\` |" >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo "## 🔨 Kernel Build Summary"
+            echo ""
+            echo "| Field | Value |"
+            echo "|---|---|"
+            echo "| Kernel Version | \`${{ steps.meta.outputs.kernel_version }}\` |"
+            echo "| ZIP Name | \`${{ steps.meta.outputs.zip_name }}\` |"
+            echo "| Toolchain | \`${{ env.TOOLCHAIN }}\` |"
+            echo "| Defconfig | \`${{ env.DEFCONFIG }}\` |"
+            echo "| Build Time | ${{ steps.meta.outputs.build_elapsed }}s |"
+            echo "| Runner | \`${{ runner.os }} / ${{ runner.arch }}\` |"
+            echo "| Triggered By | \`${{ github.event_name }}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"

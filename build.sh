@@ -20,7 +20,10 @@ source "${SCRIPT_DIR}/lib/package.sh"
 source "${SCRIPT_DIR}/lib/telegram.sh"
 source "${SCRIPT_DIR}/lib/github.sh"
 
-# ── Parse args + load config ─────────────────────────────────────────────────
+# ── Parse args then load config ───────────────────────────────────────────────
+# IMPORTANT: parse_args runs first to capture CLI values into OPT_* variables.
+# load_config then sources build.conf; CLI values are re-applied inside
+# load_config so they always win over the conf file.
 parse_args "$@"
 load_config "${SCRIPT_DIR}/config/build.conf"
 
@@ -36,7 +39,7 @@ setup_sources
 [[ "${OPT_MRPROPER:-false}" == true ]] && run_mrproper
 [[ "${OPT_CLEAN:-false}"    == true ]] && run_clean
 
-# ── Build or zip-only ────────────────────────────────────────────────────────
+# ── Build or zip-only ─────────────────────────────────────────────────────────
 if [[ -n "${OPT_ZIP_ONLY:-}" ]]; then
     log_info "Zip-only mode — skipping build"
     [[ -f "$OPT_ZIP_ONLY" ]] || die "Image not found: ${OPT_ZIP_ONLY}"
@@ -46,15 +49,15 @@ if [[ -n "${OPT_ZIP_ONLY:-}" ]]; then
     resolve_version_strings
 else
     tg_notify_start
-    run_build          # sets KERNEL_IMAGE BUILD_LOG BUILD_ELAPSED
+    run_build
 fi
 
 # ── Package ───────────────────────────────────────────────────────────────────
-create_zip            # sets ZIP_PATH
+create_zip
 
-# ── Upload & Release ─────────────────────────────────────────────────────────
-[[ "${OPT_NO_UPLOAD:-false}"  == false ]] && tg_upload_artifacts
-[[ "${OPT_NO_GITHUB:-false}"  == false ]] && gh_create_release
+# ── Upload & Release ──────────────────────────────────────────────────────────
+[[ "${OPT_NO_UPLOAD:-false}" == false ]] && tg_upload_artifacts
+[[ "${OPT_NO_GITHUB:-false}" == false ]] && gh_create_release
 
 # ── Final summary ─────────────────────────────────────────────────────────────
 tg_notify_done
