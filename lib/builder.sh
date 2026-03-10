@@ -11,8 +11,6 @@ DATETIME=""
 ZIP_NAME=""
 
 # ── Make flag array ───────────────────────────────────────────────────────────
-# Using a bash array avoids word-splitting pitfalls when any value contains
-# spaces (unlikely for toolchain paths, but defensive).
 _make_flags() {
     MAKE_FLAGS=(
         -C "$KERNEL_DIR"
@@ -50,22 +48,6 @@ resolve_version_strings() {
     ZIP_NAME="${KERNEL_NAME}-${KERNEL_VERSION}-${DATETIME}.zip"
 }
 
-# ── Post-defconfig .config patching ──────────────────────────────────────────
-# CONFIG_BUILD_ARM64_DT_OVERLAY=y injects dtbo.img into the 'all' target.
-# CAF 4.4 on a plain Ubuntu host has no mkdtimg, so we disable it after
-# running defconfig — plain `make` can then proceed without a target override.
-_patch_config() {
-    local cfg="${OUT_DIR}/.config"
-    [[ -f "$cfg" ]] || return 0
-
-    if grep -q "^CONFIG_BUILD_ARM64_DT_OVERLAY=y" "$cfg"; then
-        log_warn "Disabling CONFIG_BUILD_ARM64_DT_OVERLAY (no mkdtimg on host)"
-        sed -i \
-            's/^CONFIG_BUILD_ARM64_DT_OVERLAY=y/# CONFIG_BUILD_ARM64_DT_OVERLAY is not set/' \
-            "$cfg"
-    fi
-}
-
 # ── Full build ────────────────────────────────────────────────────────────────
 run_build() {
     log_step "Building kernel (defconfig: ${DEFCONFIG})"
@@ -74,17 +56,14 @@ run_build() {
     local start; start=$(date +%s)
 
     mkdir -p "$OUT_DIR"
-    _make_flags   # populate MAKE_FLAGS array
+    _make_flags
 
     # 1. Generate .config from defconfig
     log "Generating .config from ${DEFCONFIG}…"
     make "${MAKE_FLAGS[@]}" "$DEFCONFIG" 2>&1 | tee "$BUILD_LOG" \
         || die "defconfig step failed — see ${BUILD_LOG}"
 
-    # 2. Patch .config (remove broken dtbo.img dependency)
-    _patch_config
-
-    # 3. Resolve version + zip name now that .config exists
+    # 2. Resolve version + zip name
     resolve_version_strings
     log_info "Kernel version : ${KERNEL_VERSION}"
     log_info "Output zip     : ${ZIP_NAME}"
@@ -99,9 +78,9 @@ run_build() {
 ━━━━━━━━━━━━━━━━━━━
 _Compiling… please wait ⏳_"
 
-    # 4. Full build — plain make, no explicit target
+    # 3. Build — target Image.gz-dtb directly; skips dtbo.img entirely
     log "Compiling…"
-    if ! make "${MAKE_FLAGS[@]}" 2>&1 | tee -a "$BUILD_LOG"; then
+    if ! make "${MAKE_FLAGS[@]}" Image.gz-dtb 2>&1 | tee -a "$BUILD_LOG"; then
         local elapsed=$(( $(date +%s) - start ))
         BUILD_ELAPSED=$elapsed
         tg_send_or_edit "❌ *Build FAILED* after $(( elapsed/60 ))m $(( elapsed%60 ))s"
@@ -112,7 +91,7 @@ _Compiling… please wait ⏳_"
     BUILD_ELAPSED=$(( $(date +%s) - start ))
     log_ok "Build finished in $(( BUILD_ELAPSED/60 ))m $(( BUILD_ELAPSED%60 ))s"
 
-    # 5. Locate the kernel image (preference: dtb-appended > gz > plain)
+    # 4. Locate kernel image (preference: dtb-appended > gz > plain)
     local img_dtb="${OUT_DIR}/arch/${ARCH}/boot/Image.gz-dtb"
     local img_gz="${OUT_DIR}/arch/${ARCH}/boot/Image.gz"
     local img_plain="${OUT_DIR}/arch/${ARCH}/boot/Image"
