@@ -19,7 +19,7 @@ _sync_repo() {
         git -C "$dest" reset --hard FETCH_HEAD 2>&1 \
             | tee -a "${LOGS_DIR}/sources.log" || true
     else
-        # Directory exists but is NOT a valid git repo (stale/broken cache) — wipe it
+        # Directory exists but is NOT a valid git repo (stale cache) — wipe it
         if [[ -d "$dest" ]]; then
             log_warn "${label}: directory exists but is not a git repo — removing stale cache…"
             rm -rf "$dest"

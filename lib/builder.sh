@@ -19,6 +19,7 @@ _make_flags() {
         CROSS_COMPILE="$CROSS_COMPILE"
         CROSS_COMPILE_ARM32="$CROSS_COMPILE_ARM32"
         -j"$JOBS"
+        DTC=dtc
     )
 }
 
